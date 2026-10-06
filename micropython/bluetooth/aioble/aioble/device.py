@@ -6,10 +6,11 @@ from micropython import const
 import asyncio
 import binascii
 
-from .core import ble, register_irq_handler, log_error
+from .core import ble, register_irq_handler, log_error, _ble5_method
 
 
 _IRQ_MTU_EXCHANGED = const(21)
+_IRQ_PHY_UPDATE = const(40)
 
 
 # Raised by `with device.timeout()`.
@@ -24,6 +25,13 @@ def _device_irq(event, data):
             device.mtu = mtu
             if device._mtu_event:
                 device._mtu_event.set()
+    elif event == _IRQ_PHY_UPDATE:
+        conn_handle, status, tx_phy, rx_phy = data
+        if connection := DeviceConnection._connected.get(conn_handle, None):
+            connection._phy_pending = False
+            if connection._phy_event:
+                connection._phy_result = (status, tx_phy, rx_phy)
+                connection._phy_event.set()
 
 
 register_irq_handler(_device_irq, None)
@@ -94,7 +102,7 @@ class DeviceTimeout:
                     raise asyncio.TimeoutError
 
                 # Case 3, we have a disconnected device.
-                if self._connection and self._connection._conn_handle is None:
+                if self._connection and not self._connection.is_connected():
                     raise DeviceDisconnectedError
 
                 # Case 5, something else cancelled us.
@@ -115,6 +123,7 @@ class Device:
         self.addr_type = addr_type
         self.addr = addr if len(addr) == 6 else binascii.unhexlify(addr.replace(":", ""))
         self._connection = None
+        self._connect_pending = False
 
     def __eq__(self, rhs):
         return self.addr_type == rhs.addr_type and self.addr == rhs.addr
@@ -138,24 +147,36 @@ class Device:
         scan_duration_ms=None,
         min_conn_interval_us=None,
         max_conn_interval_us=None,
+        *,
+        phys=None,
     ):
-        if self._connection:
+        if self._connect_pending:
+            raise ValueError("Connection already pending")
+        if self._connection and self._connection.is_connected():
             return self._connection
 
         # Forward to implementation in central.py.
         from .central import _connect
 
-        await _connect(
-            DeviceConnection(self),
-            timeout_ms,
-            scan_duration_ms,
-            min_conn_interval_us,
-            max_conn_interval_us,
-        )
+        connection = DeviceConnection(self)
+        self._connect_pending = True
+        try:
+            await _connect(
+                connection,
+                timeout_ms,
+                scan_duration_ms,
+                min_conn_interval_us,
+                max_conn_interval_us,
+                phys,
+            )
+        except BaseException:
+            if self._connection is connection:
+                self._connection = None
+            raise
+        finally:
+            self._connect_pending = False
 
-        # Start the device task that will clean up after disconnection.
-        self._connection._run_task()
-        return self._connection
+        return connection
 
 
 class DeviceConnection:
@@ -174,12 +195,18 @@ class DeviceConnection:
 
         self._conn_handle = None
 
-        # This event is fired by the IRQ both for connection and disconnection
-        # and controls the device_task.
+        # This event is fired by the disconnected IRQ and controls device_task.
         self._event = asyncio.ThreadSafeFlag()
+        # This event is set after device_task has completed cleanup. Public
+        # disconnected() waiters use it so their cancellation cannot cancel
+        # the cleanup task itself.
+        self._disconnected_event = asyncio.Event()
 
         # If we're waiting for a pending MTU exchange.
         self._mtu_event = None
+        self._phy_event = None
+        self._phy_result = None
+        self._phy_pending = False
 
         # In-progress client discovery instance (e.g. services, chars,
         # descriptors) used for IRQ mapping.
@@ -210,35 +237,42 @@ class DeviceConnection:
         await self._event.wait()
 
         # Mark the device as disconnected.
-        del DeviceConnection._connected[self._conn_handle]
+        if DeviceConnection._connected.get(self._conn_handle, None) is self:
+            del DeviceConnection._connected[self._conn_handle]
         self._conn_handle = None
-        self.device._connection = None
+        if self.device._connection is self:
+            self.device._connection = None
 
         # Cancel any in-progress operations on this device.
         for t in self._timeouts:
             t._task.cancel()
+        self._disconnected_event.set()
 
     def _run_task(self):
-        self._task = asyncio.create_task(self.device_task())
+        if self._task is None:
+            self._task = asyncio.create_task(self.device_task())
 
     async def disconnect(self, timeout_ms=2000):
         await self.disconnected(timeout_ms, disconnect=True)
 
     async def disconnected(self, timeout_ms=None, disconnect=False):
-        if not self.is_connected():
+        if self._conn_handle is None:
             return
 
         # The task must have been created after successful connection.
         assert self._task
 
-        if disconnect:
+        if not self.is_connected():
+            # The handle belongs to a replacement; only finish our own task.
+            self._event.set()
+        elif disconnect:
             try:
                 ble.gap_disconnect(self._conn_handle)
             except OSError as e:
                 log_error("Disconnect", e)
 
         with DeviceTimeout(None, timeout_ms):
-            await self._task
+            await self._disconnected_event.wait()
 
     # Retrieve a single service matching this uuid.
     async def service(self, uuid, timeout_ms=2000):
@@ -265,10 +299,46 @@ class DeviceConnection:
         await pair(self, *args, **kwargs)
 
     def is_connected(self):
-        return self._conn_handle is not None
+        return (
+            self._conn_handle is not None
+            and DeviceConnection._connected.get(self._conn_handle, None) is self
+        )
+
+    def _assert_connected(self):
+        if not self.is_connected():
+            raise DeviceDisconnectedError
+
+    def phy(self):
+        self._assert_connected()
+        return _ble5_method("gap_phy")(self._conn_handle)
+
+    async def set_phy(self, tx_phys, rx_phys, *, coded=0, timeout_ms=1000):
+        self._assert_connected()
+        method = _ble5_method("gap_set_phy")
+        if self._phy_pending or self._phy_event:
+            raise ValueError("PHY update already pending")
+        self._phy_event = asyncio.ThreadSafeFlag()
+        self._phy_result = None
+        self._phy_pending = True
+        try:
+            try:
+                method(self._conn_handle, tx_phys, rx_phys, coded=coded)
+            except BaseException:
+                self._phy_pending = False
+                raise
+            with self.timeout(timeout_ms):
+                await self._phy_event.wait()
+            status, tx_phy, rx_phy = self._phy_result
+            if status:
+                raise OSError(status)
+            return tx_phy, rx_phy
+        finally:
+            # A timed-out update remains pending until its IRQ arrives.
+            self._phy_event = None
 
     # Use with `with` to simplify disconnection and timeout handling.
     def timeout(self, timeout_ms):
+        self._assert_connected()
         return DeviceTimeout(self, timeout_ms)
 
     async def exchange_mtu(self, mtu=None, timeout_ms=1000):

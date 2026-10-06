@@ -18,7 +18,12 @@ from .core import (
 from .device import DeviceConnection, DeviceTimeout
 
 _registered_characteristics = {}
+# The ATT bearer permits only one unacknowledged indication per connection.
+# Keep ownership after a Python timeout/cancellation until the final IRQ.
+_pending_indications = {}
 
+_IRQ_CENTRAL_DISCONNECT = const(2)
+_IRQ_PERIPHERAL_DISCONNECT = const(8)
 _IRQ_GATTS_WRITE = const(3)
 _IRQ_GATTS_READ_REQUEST = const(4)
 _IRQ_GATTS_INDICATE_DONE = const(20)
@@ -52,11 +57,18 @@ def _server_irq(event, data):
     elif event == _IRQ_GATTS_INDICATE_DONE:
         conn_handle, value_handle, status = data
         Characteristic._indicate_done(conn_handle, value_handle, status)
+    elif event in (_IRQ_CENTRAL_DISCONNECT, _IRQ_PERIPHERAL_DISCONNECT):
+        if data[1] == 0xFF:
+            # Failed/cancelled connection attempt, not a peer disconnection.
+            return
+        connection = DeviceConnection._connected.get(data[0], None)
+        _pending_indications.pop(connection, None)
 
 
 def _server_shutdown():
     global _registered_characteristics
     _registered_characteristics = {}
+    _pending_indications.clear()
     if hasattr(BaseCharacteristic, "_capture_task"):
         BaseCharacteristic._capture_task.cancel()
         del BaseCharacteristic._capture_queue
@@ -236,7 +248,7 @@ class Characteristic(BaseCharacteristic):
             # TODO: This should probably be a dict of connection to (ev, status).
             # Right now we just support a single indication at a time.
             self._indicate_connection = None
-            self._indicate_event = asyncio.ThreadSafeFlag()
+            self._indicate_event = None
             self._indicate_status = None
 
         self.uuid = uuid
@@ -255,6 +267,7 @@ class Characteristic(BaseCharacteristic):
     def notify(self, connection, data=None):
         if not (self.flags & _FLAG_NOTIFY):
             raise ValueError("Not supported")
+        connection._assert_connected()
         ble.gatts_notify(connection._conn_handle, self._value_handle, data)
 
     async def indicate(self, connection, data=None, timeout_ms=1000):
@@ -264,29 +277,45 @@ class Characteristic(BaseCharacteristic):
             raise ValueError("In progress")
         if not connection.is_connected():
             raise ValueError("Not connected")
+        if connection in _pending_indications:
+            raise ValueError("In progress")
 
+        event = asyncio.ThreadSafeFlag()
+        pending = (self, event, self._value_handle)
         self._indicate_connection = connection
+        self._indicate_event = event
         self._indicate_status = None
+        submitted = False
 
         try:
             with connection.timeout(timeout_ms):
+                _pending_indications[connection] = pending
                 ble.gatts_indicate(connection._conn_handle, self._value_handle, data)
-                await self._indicate_event.wait()
+                submitted = True
+                await event.wait()
                 if self._indicate_status != 0:
                     raise GattError(self._indicate_status)
         finally:
-            self._indicate_connection = None
+            if not submitted and _pending_indications.get(connection, None) is pending:
+                del _pending_indications[connection]
+            if self._indicate_event is event:
+                self._indicate_event = None
+                self._indicate_connection = None
+                self._indicate_status = None
 
     def _indicate_done(conn_handle, value_handle, status):
-        if characteristic := _registered_characteristics.get(value_handle, None):
-            if connection := DeviceConnection._connected.get(conn_handle, None):
-                if not characteristic._indicate_connection:
-                    # Timeout.
-                    return
-                # See TODO in __init__ to support multiple concurrent indications.
-                assert connection == characteristic._indicate_connection
-                characteristic._indicate_status = status
-                characteristic._indicate_event.set()
+        connection = DeviceConnection._connected.get(conn_handle, None)
+        pending = _pending_indications.get(connection, None)
+        if pending is None or pending[2] != value_handle:
+            return
+        del _pending_indications[connection]
+        characteristic, event, _ = pending
+        if (
+            characteristic._indicate_connection is connection
+            and characteristic._indicate_event is event
+        ):
+            characteristic._indicate_status = status
+            event.set()
 
 
 class BufferedCharacteristic(Characteristic):

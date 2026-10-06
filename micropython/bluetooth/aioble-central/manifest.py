@@ -1,5 +1,5 @@
-metadata(version="0.3.0")
+metadata(version="0.4.0")
 
 require("aioble-core")
 
-package("aioble", files=("central.py",), base_path="../aioble")
+package("aioble", files=("central.py", "periodic.py"), base_path="../aioble")

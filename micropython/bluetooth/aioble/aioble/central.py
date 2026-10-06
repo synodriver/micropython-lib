@@ -15,12 +15,17 @@ from .core import (
     log_error,
     log_warn,
     register_irq_handler,
+    _ble5_method,
 )
 from .device import Device, DeviceConnection, DeviceTimeout
 
 
 _IRQ_SCAN_RESULT = const(5)
 _IRQ_SCAN_DONE = const(6)
+_IRQ_SCAN_RESULT_EXT = const(41)
+_ADV_EXT_PAYLOAD_MAX_LEN = const(1650)
+_PROP_CONNECTABLE = const(1)
+_PROP_SCAN_RESPONSE = const(8)
 
 _IRQ_PERIPHERAL_CONNECT = const(7)
 _IRQ_PERIPHERAL_DISCONNECT = const(8)
@@ -48,49 +53,141 @@ _ADV_TYPE_MANUFACTURER = const(0xFF)
 _active_scanner = None
 
 
-# Set of devices that are waiting for the peripheral connect IRQ.
-_connecting = set()
+# Keep the request object until it is delivered or cancellation cleanup ends.
+_connecting = {}
+_UNCLAIMED_RETRY_MS = const(250)
+
+
+async def _cleanup_connect(connection):
+    try:
+        while (
+            not connection._connect_done
+            and ble.active()
+            and _connecting.get(connection.device, None) is connection
+        ):
+            try:
+                ble.gap_connect(None)
+            except OSError as error:
+                log_error("Cancel outgoing connection; retrying", error)
+            if not connection._connect_done:
+                try:
+                    await asyncio.wait_for_ms(
+                        connection._connect_event.wait(), _UNCLAIMED_RETRY_MS
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        while (
+            connection._conn_handle is not None
+            and ble.active()
+            and _connecting.get(connection.device, None) is connection
+        ):
+            connection._run_task()
+            # The old device task may still be consuming a disconnect when the
+            # controller reuses its handle. Never terminate the replacement.
+            if DeviceConnection._connected.get(connection._conn_handle, None) is not connection:
+                connection._event.set()
+                await connection._task
+                break
+            try:
+                if ble.gap_disconnect(connection._conn_handle) is False:
+                    connection._event.set()
+            except OSError as error:
+                log_error("Disconnect unclaimed central connection; retrying", error)
+                await asyncio.sleep_ms(_UNCLAIMED_RETRY_MS)
+            else:
+                await connection._task
+    finally:
+        if _connecting.get(connection.device, None) is connection:
+            del _connecting[connection.device]
+        connection._cleanup_task = None
 
 
 def _central_irq(event, data):
     # Send results and done events to the active scanner instance.
     if event == _IRQ_SCAN_RESULT:
         addr_type, addr, adv_type, rssi, adv_data = data
-        if not _active_scanner:
+        if not _active_scanner or _active_scanner._extended:
             return
         _active_scanner._queue.append((addr_type, bytes(addr), adv_type, rssi, bytes(adv_data)))
+        _active_scanner._event.set()
+    elif event == _IRQ_SCAN_RESULT_EXT:
+        if not _active_scanner or not _active_scanner._extended:
+            return
+        # Address/data memoryviews are only valid during this IRQ.
+        addr_type, properties, primary_phy, secondary_phy, sid, periodic_interval, data_status = (
+            data[:7]
+        )
+        addr = bytes(data[7])
+        rssi, tx_power = data[8:10]
+        adv_data = bytes(data[10])
+        _active_scanner._queue.append(
+            (
+                addr_type,
+                properties,
+                primary_phy,
+                secondary_phy,
+                sid,
+                periodic_interval,
+                data_status,
+                addr,
+                rssi,
+                tx_power,
+                adv_data,
+            )
+        )
         _active_scanner._event.set()
     elif event == _IRQ_SCAN_DONE:
         if not _active_scanner:
             return
         _active_scanner._done = True
         _active_scanner._event.set()
+        _active_scanner._done_event.set()
 
     # Peripheral connect must be in response to a pending connection, so find
     # it in the pending connection set.
     elif event == _IRQ_PERIPHERAL_CONNECT:
         conn_handle, addr_type, addr = data
 
-        for d in _connecting:
+        for d, connection in _connecting.items():
             if d.addr_type == addr_type and d.addr == addr:
-                # Allow connect() to complete.
-                connection = d._connection
+                # Register ownership before waking connect() so cancellation
+                # cannot leave an established connection without a listener.
                 connection._conn_handle = conn_handle
-                connection._event.set()
+                connection._connect_done = True
+                DeviceConnection._connected[conn_handle] = connection
+                connection._connect_event.set()
                 break
 
     # Find the active device connection for this connection handle.
     elif event == _IRQ_PERIPHERAL_DISCONNECT:
-        conn_handle, _, _ = data
-        if connection := DeviceConnection._connected.get(conn_handle, None):
+        conn_handle, addr_type, _ = data
+        if addr_type == 0xFF:
+            # NimBLE's failed/cancelled attempt has no valid peer address or
+            # handle. Only one controller initiation can be pending.
+            for connection in _connecting.values():
+                if not connection._connect_done:
+                    connection._connect_done = True
+                    connection._connect_event.set()
+                    break
+        elif connection := DeviceConnection._connected.get(conn_handle, None):
             # Tell the device_task that it should terminate.
             connection._event.set()
 
 
 def _central_shutdown():
-    global _active_scanner, _connecting
+    global _active_scanner
+    if _active_scanner:
+        _active_scanner._done = True
+        _active_scanner._event.set()
+        _active_scanner._done_event.set()
     _active_scanner = None
-    _connecting = set()
+    for connection in _connecting.values():
+        connection._connect_done = True
+        connection._connect_event.set()
+        if connection._conn_handle is not None:
+            connection._run_task()
+            connection._event.set()
+    _connecting.clear()
 
 
 register_irq_handler(_central_irq, _central_shutdown)
@@ -105,54 +202,81 @@ async def _cancel_pending():
 # Start connecting to a peripheral.
 # Call device.connect() rather than using method directly.
 async def _connect(
-    connection, timeout_ms, scan_duration_ms, min_conn_interval_us, max_conn_interval_us
+    connection, timeout_ms, scan_duration_ms, min_conn_interval_us, max_conn_interval_us, phys=None
 ):
     device = connection.device
-    if device in _connecting:
-        return
-
     # Enable BLE and cancel in-progress scans.
     ensure_active()
+    connect_ext = _ble5_method("gap_connect_ext") if phys is not None else None
     await _cancel_pending()
 
+    if device in _connecting or any(not c._connect_done for c in _connecting.values()):
+        raise ValueError("Connection or cancellation already pending")
+
     # Allow the connected IRQ to find the device by address.
-    _connecting.add(device)
+    connection._connect_event = asyncio.ThreadSafeFlag()
+    connection._connect_done = False
+    connection._cleanup_task = None
+    _connecting[device] = connection
 
-    # Event will be set in the connected IRQ, and then later
-    # reused to notify disconnection.
-    connection._event = connection._event or asyncio.ThreadSafeFlag()
-
+    submitted = False
     try:
         with DeviceTimeout(None, timeout_ms):
-            ble.gap_connect(
-                device.addr_type,
-                device.addr,
-                scan_duration_ms,
-                min_conn_interval_us,
-                max_conn_interval_us,
-            )
+            if connect_ext:
+                connect_ext(
+                    device.addr_type,
+                    device.addr,
+                    2000 if scan_duration_ms is None else scan_duration_ms,
+                    min_conn_interval_us=0
+                    if min_conn_interval_us is None
+                    else min_conn_interval_us,
+                    max_conn_interval_us=0
+                    if max_conn_interval_us is None
+                    else max_conn_interval_us,
+                    phys=phys,
+                )
+            else:
+                ble.gap_connect(
+                    device.addr_type,
+                    device.addr,
+                    scan_duration_ms,
+                    min_conn_interval_us,
+                    max_conn_interval_us,
+                )
+            submitted = True
 
             # Wait for the connected IRQ.
-            await connection._event.wait()
-            assert connection._conn_handle is not None
-
-            # Register connection handle -> device.
-            DeviceConnection._connected[connection._conn_handle] = connection
+            await connection._connect_event.wait()
+            if not connection.is_connected() or _connecting.get(device, None) is not connection:
+                raise OSError(-1)
+            connection._run_task()
+    except BaseException:
+        if submitted or connection._conn_handle is not None:
+            connection._cleanup_task = asyncio.create_task(_cleanup_connect(connection))
+        raise
     finally:
-        # After timeout, don't hold a reference and ignore future events.
-        _connecting.remove(device)
+        if connection._cleanup_task is None and _connecting.get(device, None) is connection:
+            del _connecting[device]
 
 
 # Represents a single device that has been found during a scan. The scan
 # iterator will return the same ScanResult instance multiple times as its data
 # changes (i.e. changing RSSI or advertising data).
 class ScanResult:
-    def __init__(self, device):
+    def __init__(self, device, sid=None):
         self.device = device
         self.adv_data = None
         self.resp_data = None
         self.rssi = None
         self.connectable = False
+        self.sid = sid
+        self.properties = None
+        self.primary_phy = None
+        self.secondary_phy = None
+        self.periodic_interval = 0
+        self.tx_power = None
+        self.data_status = 0
+        self._fragments = {}
 
     # New scan result available, return true if it changes our state.
     def _update(self, adv_type, rssi, adv_data):
@@ -178,6 +302,67 @@ class ScanResult:
 
         return updated
 
+    def _update_extended(self, report):
+        (
+            _,
+            properties,
+            primary_phy,
+            secondary_phy,
+            _,
+            periodic_interval,
+            status,
+            _,
+            rssi,
+            tx_power,
+            payload,
+        ) = report
+        response = bool(properties & _PROP_SCAN_RESPONSE)
+        fragments = self._fragments.pop(response, b"")
+        payload = fragments + payload if fragments is not None else None
+        if status == 1:
+            self._fragments[response] = (
+                payload
+                if payload is not None and len(payload) <= _ADV_EXT_PAYLOAD_MAX_LEN
+                else None
+            )
+            return False
+        if payload is None or len(payload) > _ADV_EXT_PAYLOAD_MAX_LEN:
+            status = 2
+
+        field = "resp_data" if response else "adv_data"
+        payload = payload if status == 0 else None
+        metadata = (
+            properties,
+            primary_phy,
+            secondary_phy,
+            periodic_interval,
+            rssi,
+            tx_power,
+            status,
+        )
+        previous = (
+            self.properties,
+            self.primary_phy,
+            self.secondary_phy,
+            self.periodic_interval,
+            self.rssi,
+            self.tx_power,
+            self.data_status,
+        )
+        updated = metadata != previous or getattr(self, field) != payload
+        (
+            self.properties,
+            self.primary_phy,
+            self.secondary_phy,
+            self.periodic_interval,
+            self.rssi,
+            self.tx_power,
+            self.data_status,
+        ) = metadata
+        self.connectable = bool(properties & _PROP_CONNECTABLE)
+        setattr(self, field, payload)
+        return updated
+
     def __str__(self):
         return "Scan result: {} {}".format(self.device, self.rssi)
 
@@ -192,9 +377,12 @@ class ScanResult:
                 continue
             i = 0
             while i + 1 < len(payload):
+                end = i + payload[i] + 1
+                if not payload[i] or end > len(payload):
+                    break
                 if payload[i + 1] in adv_type:
-                    yield payload[i + 2 : i + payload[i] + 1]
-                i += 1 + payload[i]
+                    yield payload[i + 2 : end]
+                i = end
 
     # Returns the value of the complete (or shortened) advertised name, if available.
     def name(self):
@@ -227,9 +415,19 @@ class ScanResult:
 #   async for result in scanner:
 #     ...
 class scan:
-    def __init__(self, duration_ms, interval_us=None, window_us=None, active=False):
+    def __init__(
+        self,
+        duration_ms,
+        interval_us=None,
+        window_us=None,
+        active=False,
+        *,
+        extended=False,
+        phys=None,
+    ):
         self._queue = []
         self._event = asyncio.ThreadSafeFlag()
+        self._done_event = asyncio.ThreadSafeFlag()
         self._done = False
 
         # Keep track of what we've already seen.
@@ -242,13 +440,30 @@ class scan:
         self._interval_us = interval_us or 1280000
         self._window_us = window_us or 11250
         self._active = active
+        self._extended = extended or phys is not None
+        self._phys = 1 if phys is None else phys
 
     async def __aenter__(self):
         global _active_scanner
         ensure_active()
+        scan_ext = _ble5_method("gap_scan_ext") if self._extended else None
         await _cancel_pending()
         _active_scanner = self
-        ble.gap_scan(self._duration_ms, self._interval_us, self._window_us, self._active)
+        try:
+            if scan_ext:
+                scan_ext(
+                    self._duration_ms,
+                    interval_us=self._interval_us,
+                    window_us=self._window_us,
+                    active=self._active,
+                    phys=self._phys,
+                )
+            else:
+                ble.gap_scan(self._duration_ms, self._interval_us, self._window_us, self._active)
+        except BaseException:
+            _active_scanner = None
+            self._done = True
+            raise
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_traceback):
@@ -269,22 +484,35 @@ class scan:
             raise StopAsyncIteration
 
         while True:
+            if _active_scanner != self:
+                raise StopAsyncIteration
             while self._queue:
-                addr_type, addr, adv_type, rssi, adv_data = self._queue.pop()
+                # Extended fragments must be consumed in arrival order.
+                report = self._queue.pop(0) if self._extended else self._queue.pop()
+                if self._extended:
+                    addr_type, _, _, _, sid, _, _, addr, _, _, _ = report
+                else:
+                    addr_type, addr, adv_type, rssi, adv_data = report
+                    sid = None
 
                 # Try to find an existing ScanResult for this device.
                 for r in self._results:
-                    if r.device.addr_type == addr_type and r.device.addr == addr:
+                    if r.device.addr_type == addr_type and r.device.addr == addr and r.sid == sid:
                         result = r
                         break
                 else:
                     # New device, create a new Device & ScanResult.
                     device = Device(addr_type, addr)
-                    result = ScanResult(device)
+                    result = ScanResult(device, sid)
                     self._results.add(result)
 
                 # Add the new information from this event.
-                if result._update(adv_type, rssi, adv_data):
+                updated = (
+                    result._update_extended(report)
+                    if self._extended
+                    else result._update(adv_type, rssi, adv_data)
+                )
+                if updated:
                     # It's new information, so re-yield this result.
                     return result
 
@@ -298,10 +526,15 @@ class scan:
 
     # Cancel any in-progress scan. We need to do this before starting any other operation.
     async def cancel(self):
-        if self._done:
-            return
-        ble.gap_scan(None)
-        while not self._done:
-            await self._event.wait()
         global _active_scanner
-        _active_scanner = None
+        if _active_scanner != self:
+            return
+        if not self._done:
+            if self._extended:
+                ble.gap_scan_ext(None)
+            else:
+                ble.gap_scan(None)
+        while not self._done:
+            await self._done_event.wait()
+        if _active_scanner == self:
+            _active_scanner = None

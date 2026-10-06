@@ -43,6 +43,32 @@ def config(*args, **kwargs):
     return ble.config(*args, **kwargs)
 
 
+def _ble5_method(name):
+    method = getattr(ble, name, None)
+    if method is None:
+        raise NotImplementedError("BLE 5 API unavailable: " + name)
+    ensure_active()
+    return method
+
+
+def ble5_features():
+    method = getattr(ble, "ble5_features", None)
+    if method:
+        ensure_active()
+        return method()
+    return {
+        "phys": 1,
+        "extended_advertising": False,
+        "periodic_advertising": False,
+        "advertising_instances": 1,
+        "max_adv_data_len": 31,
+    }
+
+
+def set_default_phy(tx_phys, rx_phys):
+    _ble5_method("gap_set_phy")(None, tx_phys, rx_phys)
+
+
 # Because different functionality is enabled by which files are available the
 # different modules can register their IRQ handlers and shutdown handlers
 # dynamically.

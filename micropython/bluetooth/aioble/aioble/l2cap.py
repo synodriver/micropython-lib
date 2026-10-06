@@ -102,7 +102,7 @@ class L2CAPChannel:
         self._event = asyncio.ThreadSafeFlag()
 
     def _assert_connected(self):
-        if self._cid is None:
+        if self._cid is None or not self._connection.is_connected():
             raise L2CAPDisconnectedError
 
     async def recvinto(self, buf, timeout_ms=None):
@@ -157,7 +157,7 @@ class L2CAPChannel:
                 self._assert_connected()
 
     async def disconnect(self, timeout_ms=1000):
-        if self._cid is None:
+        if self._cid is None or not self._connection.is_connected():
             return
 
         # Wait for the cid to be cleared by the disconnect IRQ.

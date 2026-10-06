@@ -165,6 +165,7 @@ async def pair(
     io=_IO_CAPABILITY_NO_INPUT_OUTPUT,
     timeout_ms=20000,
 ):
+    connection._assert_connected()
     ble.config(bond=bond, le_secure=le_secure, mitm=mitm, io=io)
 
     with connection.timeout(timeout_ms):

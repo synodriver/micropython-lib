@@ -123,6 +123,7 @@ class ClientDiscover:
         return self
 
     async def __anext__(self):
+        self._connection._assert_connected()
         if self._connection._discover != self:
             # Start the discovery if necessary.
             await self._start()
@@ -130,6 +131,7 @@ class ClientDiscover:
         # Keep returning items from the queue until the status is set by the
         # done IRQ.
         while True:
+            self._connection._assert_connected()
             while self._queue:
                 return self._disc_type(self._parent, *self._queue.pop())
             if self._status is not None:
@@ -219,6 +221,7 @@ class BaseClientCharacteristic:
 
     # Register this value handle so events can find us.
     def _register_with_connection(self):
+        self._connection()._assert_connected()
         self._connection()._characteristics[self._value_handle] = self
 
     # Map an incoming IRQ to an registered characteristic.
@@ -236,6 +239,7 @@ class BaseClientCharacteristic:
     def _check(self, flag):
         if not (self.properties & flag):
             raise ValueError("Unsupported")
+        self._connection()._assert_connected()
 
     # Issue a read to the characteristic.
     async def read(self, timeout_ms=1000):
