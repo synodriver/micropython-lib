@@ -48,6 +48,16 @@ Security:
 * Initiate pairing.
 * Query encryption/authentication state.
 
+ESP32 BLE 5 extensions (require this project's firmware and adapted aioble):
+* Query firmware capabilities, set default PHY preferences, and query or negotiate
+  a connection's 1M/2M/Coded PHY.
+* Scan extended advertisements, decode SID, PHY and periodic advertising metadata,
+  and reassemble fragmented payloads.
+* Use connectable, scannable or nonconnectable extended advertising, including
+  multiple advertising instances running in parallel.
+* Advertise periodically, synchronise and iterate reports, handle sync loss, and
+  release resources.
+
 All remote operations (connect, disconnect, client read/write, server indicate, l2cap recv/send, pair) are awaitable and support timeouts.
 
 Installation
@@ -273,18 +283,96 @@ or selected by a custom frozen manifest. Use ESP-IDF v5.5.5 as in that workflow;
 the existing port audit identifies an SDK periodic-sync retry defect in
 v5.5 through v5.5.3 that this Python adapter cannot correct.
 
-#### Capabilities and PHY
+#### Running the examples below
+
+Run the asynchronous snippets inside `main()`. Helper functions can be defined
+outside `main()`. Use each example independently; examples cannot share an
+occupied advertising instance. Replace sample addresses and address types with
+the peer's actual values. Both devices must support the selected PHY.
 
 ```py
-print(aioble.ble5_features())
+import asyncio
+import aioble
 
-# These are masks, unlike the PHY values reported by phy() and scan results.
+async def main():
+    # Place the asynchronous snippet you want to run here.
+    print(aioble.ble5_features())
+
+try:
+    asyncio.run(main())
+finally:
+    aioble.stop()
+```
+
+aioble enables BLE automatically and dispatches its IRQs. Do not replace its
+callback with `bluetooth.BLE().irq()`, or directly start or stop scans,
+advertising instances or periodic syncs that aioble manages. Release them through
+the tasks, context managers and `close()` methods shown below.
+
+The new firmware APIs map to aioble as follows:
+
+| Firmware API | aioble usage |
+| --- | --- |
+| `ble5_features()` | `aioble.ble5_features()` |
+| `gap_set_phy(None, ...)` | `aioble.set_default_phy(tx_phys, rx_phys)` |
+| `gap_phy()` / `gap_set_phy(conn_handle, ...)` | `connection.phy()` / `await connection.set_phy(...)` |
+| `gap_scan_ext()` | `aioble.scan(..., extended=True, phys=...)`; exit the context or `await scanner.cancel()` to stop scanning |
+| `gap_connect_ext()` | `await device.connect(phys=...)`; use the connection context or `await connection.disconnect()` to disconnect |
+| `gap_advertise_ext()` / `gap_advertise_ext_stop()` | `await aioble.advertise(..., extended=True)`; the instance is cleaned up after timeout, cancellation or successful connection |
+| `gap_periodic_advertise()` | `async with aioble.periodic_advertise(...)`; exiting stops both periodic advertising and the extended discovery advertisements |
+| `gap_periodic_sync()` / `gap_periodic_sync_stop()` | `await aioble.periodic_sync(...)`; cancelled creation is cleaned up in the background; close an established sync through its context or `await sync.close()` |
+
+#### Capabilities and PHY
+
+Query firmware capabilities first. These reflect the build configuration; the
+controller still validates individual operations, and negotiation also depends
+on the peer. On older firmware the query returns legacy capabilities (1M,
+31 bytes, instance 0 only), which do not imply support for the extended APIs.
+
+| Capability field | Meaning |
+| --- | --- |
+| `phys` | Supported PHY mask; test Coded support with `features["phys"] & aioble.PHY_CODED_MASK` |
+| `extended_advertising` | Whether extended advertising is enabled |
+| `periodic_advertising` | Whether periodic advertising is enabled; synchronisation also requires the corresponding firmware API |
+| `advertising_instances` | Total instances, including instance 0 reserved for legacy advertising; provided when extended advertising is enabled |
+| `max_adv_data_len` | Configured advertising payload limit, rather than the limit of one AD field; provided when extended advertising is enabled |
+
+PHY **values** are `PHY_1M=1`, `PHY_2M=2`, and `PHY_CODED=3`, used for advertising
+parameters and reported results. PHY **masks** are `PHY_1M_MASK=1`,
+`PHY_2M_MASK=2`, and `PHY_CODED_MASK=4`, used for scanning, connection initiation
+and PHY preferences. Combine masks with `|`; do not use `PHY_CODED` as a mask.
+
+Set default preferences for subsequent connections, initiate an extended
+connection using 1M, then request 2M:
+
+```py
+features = aioble.ble5_features()
+print(features)
+
 phys = aioble.PHY_1M_MASK | aioble.PHY_2M_MASK
 aioble.set_default_phy(phys, phys)
 
-connection = await device.connect(phys=aioble.PHY_CODED_MASK)
-print(connection.phy())                # (tx_phy, rx_phy)
-print(await connection.set_phy(phys, phys, timeout_ms=1000))
+device = aioble.Device(aioble.ADDR_PUBLIC, "aa:bb:cc:dd:ee:ff")
+async with await device.connect(phys=aioble.PHY_1M_MASK, timeout_ms=10000) as connection:
+    print(connection.phy())            # (tx_phy, rx_phy): values, not masks
+    print(await connection.set_phy(
+        aioble.PHY_2M_MASK, aioble.PHY_2M_MASK, timeout_ms=1000,
+    ))
+    # Use existing GATT, pairing, etc. here; exiting the context disconnects.
+```
+
+Default preferences do not actively change existing connections. Use the
+returned PHY values to check the update; 2M is not guaranteed. If the peer
+advertises using Coded, use the following connection and S8 preference example
+instead (`coded=1` selects S2):
+
+```py
+device = aioble.Device(aioble.ADDR_RANDOM, "aa:bb:cc:dd:ee:ff")
+async with await device.connect(phys=aioble.PHY_CODED_MASK, timeout_ms=10000) as connection:
+    print(connection.phy())
+    print(await connection.set_phy(
+        aioble.PHY_CODED_MASK, aioble.PHY_CODED_MASK, coded=2, timeout_ms=1000,
+    ))
 ```
 
 `Device.connect(..., phys=None)` uses the legacy connection API. Providing
@@ -323,8 +411,12 @@ be cancelled independently.
 
 `set_phy(tx_phys, rx_phys, *, coded=0, timeout_ms=1000)` waits for the PHY update
 IRQ and returns the negotiated PHY values. `coded=0/1/2` selects no preference,
-S2, or S8. A timed-out update remains reserved until its IRQ arrives, so a late
-completion cannot satisfy a subsequent request. Failed BLE 5 IRQ operations
+S2, or S8. `set_default_phy()` does not accept a `coded` argument. Only one PHY
+update can be pending on each connection. A timed-out or cancelled update remains
+reserved until its IRQ arrives; another update raises `ValueError` in the meantime,
+so a late completion cannot satisfy a subsequent request. Callers can catch
+`asyncio.TimeoutError`, but should not immediately submit another update.
+Failed BLE 5 IRQ operations
 raise `OSError(status)` with the raw NimBLE status; immediate method failures
 retain the port's errno mapping.
 
@@ -337,13 +429,22 @@ async with aioble.scan(
     interval_us=30000, window_us=30000, active=True,
 ) as scanner:
     async for result in scanner:
-        print(result.name(), result.sid, result.primary_phy, result.secondary_phy)
+        print(result.device, result.sid, result.primary_phy, result.secondary_phy)
+        if result.data_status == 0:
+            print(result.name(), list(result.manufacturer()), result.adv_data, result.resp_data)
+        else:
+            print("Incomplete payload", result.data_status)
 ```
 
 `extended=True` selects the extended scan API. Providing `phys` also selects
 it; the default is the 1M mask. Scanning supports 1M and Coded, not 2M on the
 primary advertising channels. There is still only one scanner. Starting a
 connection cancels aioble's active scanner as before.
+Use `active=True` to obtain scan responses from scannable advertisers, or
+`active=False` to receive advertisements only. `duration_ms=0` scans indefinitely.
+Breaking the loop and exiting the context stops scanning; you can also call
+`await scanner.cancel()` explicitly. The interval and window are in microseconds,
+and the window must not exceed the interval.
 
 An extended `ScanResult` includes `properties`, `sid`, `primary_phy`,
 `secondary_phy`, `periodic_interval`, `tx_power`, and `data_status` alongside
@@ -360,21 +461,36 @@ oversized chains produce `data_status=2` with the affected payload set to
 payload limit is 1650 bytes. Address and payload memoryviews are copied during
 the IRQ. Queued scan results and periodic reports should be consumed promptly;
 their queues grow if the application cannot keep up.
+The scanner yields the same `ScanResult` object again as it changes. Copy the
+fields you need when storing historical results rather than keeping only an
+object reference. `data_status` describes the most recent report; advertising
+and response payloads are stored separately in `adv_data` and `resp_data`.
+Check whether the relevant payload is `None` before parsing it.
 
 #### Extended advertising
 
 ```py
-connection = await aioble.advertise(
-    100000, extended=True, instance=1, sid=2,
-    secondary_phy=aioble.PHY_2M,
-    name=b"extended-sensor", manufacturer=(0xabcd, b"x" * 80),
-    timeout_ms=10000,
-)
+try:
+    connection = await aioble.advertise(
+        100000, extended=True, instance=1, sid=2,
+        secondary_phy=aioble.PHY_2M,
+        name=b"extended-sensor", manufacturer=(0xabcd, b"x" * 80),
+        timeout_ms=10000,
+    )
+    if connection is not None:          # Cancelling the advertising task returns None
+        async with connection:
+            print("Connection from", connection.device, connection.phy())
+            await connection.disconnected()
+except asyncio.TimeoutError:
+    print("Advertising wait timed out")
 ```
 
 The added keyword parameters are `extended=False`, `instance=1`,
 `scannable=False`, `primary_phy=1`, `secondary_phy=1`, and `sid=0`.
-PHY parameters here are values, not masks. Extended instances must be greater
+PHY parameters here are values, not masks. The primary PHY must be `PHY_1M` or
+`PHY_CODED`; the secondary PHY can be 1M, 2M or Coded. SID ranges from 0 to 15.
+For Coded advertising, set both `primary_phy` and `secondary_phy` to
+`aioble.PHY_CODED`. Extended instances must be greater
 than zero; instance zero remains reserved for legacy advertising. Automatic
 payload generation uses the firmware's `max_adv_data_len` and keeps all fields
 in one payload (at most 251 bytes for connectable advertising). Each AD field
@@ -393,6 +509,72 @@ raise `TypeError` and invalid values raise `ValueError` before reserving it.
 Timeouts and task cancellation stop only the selected instance; extended
 instances are also removed on completion. As with the original API,
 `timeout_ms` uses an asyncio timeout, and cancellation returns `None`.
+
+Scannable, nonconnectable extended advertising places the automatically generated
+name and manufacturer data in the scan response. Use the `active=True` scanning
+example above on the receiver:
+
+```py
+try:
+    await aioble.advertise(
+        100000, extended=True, instance=1, sid=2,
+        connectable=False, scannable=True,
+        name=b"scan-response-sensor", manufacturer=(0xabcd, b"x" * 80),
+        timeout_ms=10000,
+    )
+except asyncio.TimeoutError:
+    print("Scannable advertising finished")
+```
+
+Supply a manual payload for nonconnectable, nonscannable extended advertising,
+then stop it by cancelling the task:
+
+```py
+# A valid manufacturer AD field: length, type 0xff, two-byte ID, 80 bytes of data.
+payload = b"\x53\xff\xcd\xab" + b"x" * 80
+task = asyncio.create_task(aioble.advertise(
+    100000, adv_data=payload, resp_data=b"",
+    extended=True, instance=1, sid=1, connectable=False, scannable=False,
+))
+try:
+    await asyncio.sleep_ms(10000)
+finally:
+    task.cancel()
+    await task                         # Wait for instance cleanup after cancellation.
+```
+
+Manual payloads must contain valid AD fields. Supplying `adv_data` or `resp_data`
+disables automatic generation from `name`, `services`, etc. For manual scannable
+advertising, use `adv_data=b""` and put the payload in `resp_data`. When one payload
+is supplied manually, `None` for the other clears it; an explicit `b""` also
+clears it. This differs from the low-level `gap_advertise_ext()` API, where `None`
+reuses cached data.
+
+Multiple extended instances can advertise concurrently in separate tasks. These
+two instances each run for 10 seconds; `advertising_instances` must be at least 3
+to use instances 1 and 2:
+
+```py
+async def broadcast(instance, sid, name):
+    try:
+        await aioble.advertise(
+            100000, extended=True, instance=instance, sid=sid,
+            connectable=False, name=name, timeout_ms=10000,
+        )
+    except asyncio.TimeoutError:
+        print("Instance finished", instance)
+
+if aioble.ble5_features().get("advertising_instances", 1) >= 3:
+    await asyncio.gather(
+        broadcast(1, 1, b"sensor-one"),
+        broadcast(2, 2, b"sensor-two"),
+    )
+```
+
+Separate tasks can also wait for extended connections on different instances;
+manage and disconnect each returned connection separately. `instance` identifies
+a local resource, while `sid` identifies the advertisement to scanners. They do
+not need to have the same value.
 
 If a connection races with cancellation or timeout, aioble keeps responsibility
 for it until the two connection IRQs have been associated and disconnects it in
@@ -422,6 +604,12 @@ periodic train. `adv_data` is the periodic payload; `discovery_data` is the
 extended payload used to discover it. Exiting the context stops both and
 removes the instance. Periodic intervals are in microseconds, with a 7500us
 minimum; the port applies the controller's 1.25ms units.
+The example sends periodic data every 100ms with SID 3; use the discovery and
+synchronisation example below on the receiver. Both periodic and discovery data
+are supplied by the caller; aioble does not automatically add a name or other AD
+fields. The context does not provide an in-place payload update method. Exit and
+enter a new context with the new payload to change it; this interrupts and
+restarts the periodic train. Task cancellation also runs the context cleanup.
 
 Periodic advertising uses the same instance validation and background cleanup.
 If stopping or removing an instance fails, the error propagates and the instance
@@ -433,33 +621,76 @@ the original start error propagates and rollback continues in the background.
 Keep scanning while the controller establishes the sync:
 
 ```py
+sync = None
 async with aioble.scan(0, extended=True) as scanner:
     async for result in scanner:
-        if result.periodic_interval and 0 <= result.sid <= 15:
-            sync = await aioble.periodic_sync(result, timeout_ms=10000)
+        # Matches the advertiser above; also filter by result.device address in practice.
+        if result.periodic_interval and result.sid == 3:
+            sync = await aioble.periodic_sync(
+                result, timeout_ms=10000, sync_timeout_ms=10000,
+            )
             break
 
-async with sync:
-    try:
-        async for report in sync:
-            if report.data_status == 0:
-                print(report.adv_data, report.rssi, report.tx_power)
-    except aioble.PeriodicSyncLostError as error:
-        print("Sync lost", error.reason)
+    if sync is not None:
+        async with sync:
+            await scanner.cancel()     # Own sync cleanup before stopping discovery scanning.
+            print(sync.device, sync.sid, sync.periodic_interval * 1.25, sync.phy)
+            try:
+                async for report in sync:
+                    if report.data_status == 0:
+                        print(report.adv_data, report.rssi, report.tx_power)
+                    else:
+                        print("Incomplete periodic data", report.data_status)
+            except aioble.PeriodicSyncLostError as error:
+                print("Sync lost", error.reason)
 ```
 
-`periodic_sync(device_or_scan_result, *, sid=None, skip=0, timeout_ms=10000,
+`scan(0, ...)` waits indefinitely for a matching advertiser; cancel the containing
+task to end the wait. For general discovery, use
+`result.periodic_interval and 0 <= result.sid <= 15`; do not try to synchronise
+with legacy advertisements whose SID is 255. Scanning can stop once the sync is
+established; periodic reception does not require the scanner to keep running.
+Breaking the report loop closes the sync through its context manager.
+
+`periodic_sync(device, *, sid=None, skip=0, timeout_ms=10000,
 sync_timeout_ms=10000)` accepts a `Device` with an explicit SID or an extended
 `ScanResult`, and returns a `PeriodicSync`. `timeout_ms` is the local asyncio
 deadline; `sync_timeout_ms` is the controller timeout (100..163840ms).
+A local timeout raises `asyncio.TimeoutError`; a controller creation failure
+raises `OSError(status)`. `skip` ranges from 0 to 499 and specifies how many
+periodic advertising events may be skipped after synchronisation; the default
+is 0, without skipping.
 Only one sync creation can be pending; established syncs are routed by handle.
 Explicit addresses are used, so the SDK advertiser-list retry restriction
 does not apply.
+
+If the advertiser's address and SID are known, pass a `Device` directly and
+explicitly close the established sync:
+
+```py
+device = aioble.Device(aioble.ADDR_PUBLIC, "aa:bb:cc:dd:ee:ff")
+async with aioble.scan(0, extended=True) as scanner:
+    sync = await aioble.periodic_sync(
+        device, sid=3, skip=1, timeout_ms=10000, sync_timeout_ms=5000,
+    )
+    try:
+        await scanner.cancel()
+        print(sync.is_synced(), sync.device, sync.sid, sync.phy)
+        # Iterate reports here as in the example above.
+    finally:
+        await sync.close(timeout_ms=1000)
+```
+
+If the advertiser uses Coded on its primary PHY, the scan during creation must
+also include `phys=aioble.PHY_1M_MASK | aioble.PHY_CODED_MASK`, or select only Coded.
 
 The sync exposes `device`, `sid`, `periodic_interval` (1.25ms units), `phy`,
 `is_synced()`, and `await close(timeout_ms=1000)`. Reports expose `adv_data`,
 `data_status`, `rssi`, and `tx_power`. Complete fragment chains are assembled;
 truncated/failed reports have `adv_data=None` and retain their status.
+`data_status=0` means complete, 1 means more fragments, 2 means truncated, and
+3 means reception failed. The iterator buffers status 1 fragments and yields a
+report only when the chain ends; complete payloads have the same 1650-byte limit.
 Closing waits for the sync-lost event. Do not close an established sync while
 another create is pending: NimBLE rejects termination with a busy error.
 

@@ -49,6 +49,12 @@ L2CAP：
 * 发起配对。
 * 查询加密/认证状态。
 
+ESP32 BLE 5 扩展（需要本项目固件和适配后的 aioble）：
+* 查询固件能力，设置默认 PHY，查询和协商连接的 1M/2M/Coded PHY。
+* 扩展扫描，解析 SID、PHY 和周期广播信息，重组分片载荷。
+* 可连接、可扫描或不可连接的扩展广播，以及多个广播实例并行运行。
+* 周期广播、周期同步和报告迭代，处理同步丢失并释放资源。
+
 所有远程操作（连接、断开连接、客户端读写、服务器指示、l2cap 接收/发送、配对）都可等待，并支持超时。
 
 安装
@@ -261,18 +267,88 @@ ESP32 BLE 5 固件工作流启用底层 API；其默认开发板清单不会冻�
 请按该工作流使用 ESP-IDF v5.5.5；现有端口审计指出，v5.5 至 v5.5.3 存在 SDK 周期同步重试缺陷，
 此 Python 适配器无法修复该缺陷。
 
-#### 功能与 PHY
+#### 运行下面的用例
+
+异步片段放在 `main()` 内运行；包含辅助函数的片段可将函数定义放在 `main()` 外。
+各用例独立使用，同一实例不能被多个用例同时占用。地址示例需要替换为对端的实际
+地址和地址类型；两端都要支持选择的 PHY。
 
 ```py
-print(aioble.ble5_features())
+import asyncio
+import aioble
 
-# 这些是掩码，与 phy() 和扫描结果报告的 PHY 值不同。
+async def main():
+    # 将下面要运行的异步片段放在这里。
+    print(aioble.ble5_features())
+
+try:
+    asyncio.run(main())
+finally:
+    aioble.stop()
+```
+
+aioble 自动启用 BLE，并负责 IRQ 分发。使用它时不要另行调用
+`bluetooth.BLE().irq()` 覆盖回调，也不要绕过 aioble 直接启停它管理的扫描、
+广播实例或周期同步；通过下面的任务、上下文管理器和 `close()` 释放资源。
+
+新增固件 API 与 aioble 用法的对应关系：
+
+| 固件 API | aioble 用法 |
+| --- | --- |
+| `ble5_features()` | `aioble.ble5_features()` |
+| `gap_set_phy(None, ...)` | `aioble.set_default_phy(tx_phys, rx_phys)` |
+| `gap_phy()` / `gap_set_phy(conn_handle, ...)` | `connection.phy()` / `await connection.set_phy(...)` |
+| `gap_scan_ext()` | `aioble.scan(..., extended=True, phys=...)`；退出上下文或 `await scanner.cancel()` 停止扫描 |
+| `gap_connect_ext()` | `await device.connect(phys=...)`；用连接上下文或 `await connection.disconnect()` 断开 |
+| `gap_advertise_ext()` / `gap_advertise_ext_stop()` | `await aioble.advertise(..., extended=True)`；超时、取消或成功建连后自动清理实例 |
+| `gap_periodic_advertise()` | `async with aioble.periodic_advertise(...)`；退出时停止周期广播和用于发现的扩展广播 |
+| `gap_periodic_sync()` / `gap_periodic_sync_stop()` | `await aioble.periodic_sync(...)`；创建取消由后台清理，已建立同步用上下文或 `await sync.close()` 关闭 |
+
+#### 功能与 PHY
+
+先查询固件能力。返回值反映构建配置；控制器仍会校验具体操作，连接协商还依赖对端。
+旧固件上此查询返回兼容能力（1M、31 字节、仅实例 0），并不意味着支持扩展 API。
+
+| 能力字段 | 含义 |
+| --- | --- |
+| `phys` | 支持的 PHY 掩码，可用 `features["phys"] & aioble.PHY_CODED_MASK` 检查 Coded |
+| `extended_advertising` | 是否启用扩展广播 |
+| `periodic_advertising` | 是否启用周期广播功能；周期同步还需要对应固件 API |
+| `advertising_instances` | 实例总数，包含保留给传统广播的实例 0；启用扩展广播时提供 |
+| `max_adv_data_len` | 固件配置的广播载荷上限，不是单个 AD 字段的上限；启用扩展广播时提供 |
+
+PHY **值**为 `PHY_1M=1`、`PHY_2M=2`、`PHY_CODED=3`，用于广播参数和结果。
+PHY **掩码**为 `PHY_1M_MASK=1`、`PHY_2M_MASK=2`、`PHY_CODED_MASK=4`，
+用于扫描、建连和 PHY 偏好；可用 `|` 组合，不能把 `PHY_CODED` 当作掩码。
+
+设置后续连接的默认偏好，用 1M 发起扩展连接，再请求 2M：
+
+```py
+features = aioble.ble5_features()
+print(features)
+
 phys = aioble.PHY_1M_MASK | aioble.PHY_2M_MASK
 aioble.set_default_phy(phys, phys)
 
-connection = await device.connect(phys=aioble.PHY_CODED_MASK)
-print(connection.phy())                # (tx_phy, rx_phy)
-print(await connection.set_phy(phys, phys, timeout_ms=1000))
+device = aioble.Device(aioble.ADDR_PUBLIC, "aa:bb:cc:dd:ee:ff")
+async with await device.connect(phys=aioble.PHY_1M_MASK, timeout_ms=10000) as connection:
+    print(connection.phy())            # (tx_phy, rx_phy)，是值而不是掩码
+    print(await connection.set_phy(
+        aioble.PHY_2M_MASK, aioble.PHY_2M_MASK, timeout_ms=1000,
+    ))
+    # 可在此使用现有 GATT、配对等接口；退出上下文时断开连接。
+```
+
+默认偏好不会主动修改已有连接。更新结果以返回的 PHY 为准，并不保证使用 2M。
+对端采用 Coded 广播时，可改用下面的连接与 S8 偏好用例（S2 使用 `coded=1`）：
+
+```py
+device = aioble.Device(aioble.ADDR_RANDOM, "aa:bb:cc:dd:ee:ff")
+async with await device.connect(phys=aioble.PHY_CODED_MASK, timeout_ms=10000) as connection:
+    print(connection.phy())
+    print(await connection.set_phy(
+        aioble.PHY_CODED_MASK, aioble.PHY_CODED_MASK, coded=2, timeout_ms=1000,
+    ))
 ```
 
 `Device.connect(..., phys=None)` 使用旧版连接 API。
@@ -304,7 +380,9 @@ PHY、MTU、GATT、配对和 L2CAP 操作会在发送命令前拒绝过期连接
 
 `set_phy(tx_phys, rx_phys, *, coded=0, timeout_ms=1000)` 会等待 PHY 更新 IRQ 并返回协商后的 PHY 值。
 `coded=0/1/2` 分别表示无偏好、S2 或 S8。
-超时的更新会一直保留，直到其 IRQ 到达，因此延迟完成不会满足后续请求。
+`set_default_phy()` 不接受 `coded` 参数。一次连接只能有一个未完成的 PHY 更新；
+超时或取消后也会一直保留该更新，直到其 IRQ 到达，期间再次更新会引发 `ValueError`，
+因此延迟完成不会满足后续请求。调用者可捕获 `asyncio.TimeoutError`，不要立即重复提交。
 失败的 BLE 5 IRQ 操作会以原始 NimBLE 状态引发 `OSError(status)`；
 方法立即失败时仍保留端口的 errno 映射。
 
@@ -317,12 +395,19 @@ async with aioble.scan(
     interval_us=30000, window_us=30000, active=True,
 ) as scanner:
     async for result in scanner:
-        print(result.name(), result.sid, result.primary_phy, result.secondary_phy)
+        print(result.device, result.sid, result.primary_phy, result.secondary_phy)
+        if result.data_status == 0:
+            print(result.name(), list(result.manufacturer()), result.adv_data, result.resp_data)
+        else:
+            print("载荷不完整", result.data_status)
 ```
 
 `extended=True` 会选择扩展扫描 API。提供 `phys` 也会选择该 API；默认值为 1M 掩码。
 扫描支持 1M 和 Coded，但不支持主广播信道上的 2M。
 仍然只有一个扫描器。发起连接时，aioble 会像以前一样取消活动扫描器。
+`active=True` 用于获取可扫描广播的响应；只接收广播时可用 `active=False`。
+`duration_ms=0` 表示持续扫描；循环中 `break` 后退出上下文会停止扫描，
+也可显式 `await scanner.cancel()`。间隔和窗口以微秒为单位，窗口不得大于间隔。
 
 扩展的 `ScanResult` 除现有属性和字段解码器外，还包含 `properties`、`sid`、`primary_phy`、
 `secondary_phy`、`periodic_interval`、`tx_power` 和 `data_status`。
@@ -337,21 +422,33 @@ async with aioble.scan(
 组装后的载荷上限为 1650 字节。
 地址和载荷的 memoryview 会在 IRQ 期间复制。
 应及时消费排队的扫描结果和周期报告；如果应用跟不上，队列会增长。
+扫描器会重复返回更新后的同一 `ScanResult` 对象；需要保存历史记录时，复制所需字段，
+不要只保存对象引用。`data_status` 描述最近一次报告，广播载荷和响应载荷分别保存在
+`adv_data`、`resp_data` 中；解析前应检查对应载荷是否为 `None`。
 
 #### 扩展广播
 
 ```py
-connection = await aioble.advertise(
-    100000, extended=True, instance=1, sid=2,
-    secondary_phy=aioble.PHY_2M,
-    name=b"extended-sensor", manufacturer=(0xabcd, b"x" * 80),
-    timeout_ms=10000,
-)
+try:
+    connection = await aioble.advertise(
+        100000, extended=True, instance=1, sid=2,
+        secondary_phy=aioble.PHY_2M,
+        name=b"extended-sensor", manufacturer=(0xabcd, b"x" * 80),
+        timeout_ms=10000,
+    )
+    if connection is not None:          # 广播任务被取消时返回 None
+        async with connection:
+            print("连接来自", connection.device, connection.phy())
+            await connection.disconnected()
+except asyncio.TimeoutError:
+    print("广播等待超时")
 ```
 
 新增的关键字参数为 `extended=False`、`instance=1`、`scannable=False`、`primary_phy=1`、
 `secondary_phy=1` 和 `sid=0`。
 此处的 PHY 参数是值而不是掩码。
+主 PHY 仅允许 `PHY_1M` 或 `PHY_CODED`，辅 PHY 可用 1M、2M 或 Coded；SID 范围为 0..15。
+要用 Coded 广播，可将 `primary_phy` 和 `secondary_phy` 都设为 `aioble.PHY_CODED`。
 扩展实例必须大于零；实例零仍保留给旧版广播。
 自动载荷生成使用固件的 `max_adv_data_len`，并将所有字段保存在一个载荷中
 （可连接广播最多 251 字节）。
@@ -368,6 +465,66 @@ connection = await aioble.advertise(
 无效类型会在预留实例前引发 `TypeError`，无效值会引发 `ValueError`。
 超时和任务取消只会停止选定的实例；扩展实例也会在完成时移除。
 与原 API 一样，`timeout_ms` 使用 asyncio 超时，取消时返回 `None`。
+
+可扫描、不可连接的扩展广播：自动生成的名称和厂商数据进入扫描响应，
+接收端应使用上面的 `active=True` 扫描用例。
+
+```py
+try:
+    await aioble.advertise(
+        100000, extended=True, instance=1, sid=2,
+        connectable=False, scannable=True,
+        name=b"scan-response-sensor", manufacturer=(0xabcd, b"x" * 80),
+        timeout_ms=10000,
+    )
+except asyncio.TimeoutError:
+    print("可扫描广播已结束")
+```
+
+手动载荷、不可连接且不可扫描的扩展广播，并通过取消任务停止：
+
+```py
+# 一个合法的厂商 AD 字段：长度、类型 0xff、两字节厂商 ID、80 字节数据。
+payload = b"\x53\xff\xcd\xab" + b"x" * 80
+task = asyncio.create_task(aioble.advertise(
+    100000, adv_data=payload, resp_data=b"",
+    extended=True, instance=1, sid=1, connectable=False, scannable=False,
+))
+try:
+    await asyncio.sleep_ms(10000)
+finally:
+    task.cancel()
+    await task                         # 等待实例清理，不只调用 cancel()
+```
+
+手动载荷必须是合法 AD 字段；提供 `adv_data` 或 `resp_data` 后不会再根据
+`name`、`services` 等参数自动生成数据。手动可扫描广播应使用 `adv_data=b""`，
+把数据放入 `resp_data`。
+手动指定载荷时，另一载荷为 `None` 会被清空，显式 `b""` 也表示清空；
+这与底层 `gap_advertise_ext()` 的 `None` 复用缓存语义不同。
+
+多个扩展实例可在独立任务中并行广播。以下两个实例各运行 10 秒；
+`advertising_instances` 至少为 3 才能使用实例 1 和 2。
+
+```py
+async def broadcast(instance, sid, name):
+    try:
+        await aioble.advertise(
+            100000, extended=True, instance=instance, sid=sid,
+            connectable=False, name=name, timeout_ms=10000,
+        )
+    except asyncio.TimeoutError:
+        print("实例结束", instance)
+
+if aioble.ble5_features().get("advertising_instances", 1) >= 3:
+    await asyncio.gather(
+        broadcast(1, 1, b"sensor-one"),
+        broadcast(2, 2, b"sensor-two"),
+    )
+```
+
+也可在不同任务中使用不同实例等待扩展连接；每个返回的连接都需要分别管理和断开。
+广播 `instance` 是本机资源编号，`sid` 是发送给扫描器的广播标识，二者不要求相同。
 
 如果连接与取消或超时发生竞争，aioble 会继续负责该连接，直到两个连接 IRQ 完成关联，
 并在 asyncio 任务中断开它。
@@ -394,6 +551,10 @@ discovery_data=b"", extended_interval_us=100000, primary_phy=1, secondary_phy=1)
 `adv_data` 是周期载荷；`discovery_data` 是用于发现该周期广播的扩展载荷。
 退出上下文时会停止两者并移除实例。
 周期间隔以微秒为单位，最小值为 7500us；端口会应用控制器的 1.25ms 单位。
+上述用例每 100ms 发送周期数据，SID 为 3；接收端可运行下一节的发现与同步用例。
+周期数据和发现数据都由调用者提供，aioble 不会自动添加名称或其他 AD 字段。
+此上下文不提供就地更新载荷的方法；需要换数据时先退出，再用新载荷重新进入，
+周期广播序列会中断并重新建立。任务取消时也会执行上下文清理。
 
 周期广播使用相同的实例验证和后台清理机制。
 如果停止或移除实例失败，错误会传递出去，并且实例在清理重试期间保持预留状态。
@@ -404,31 +565,68 @@ discovery_data=b"", extended_interval_us=100000, primary_phy=1, secondary_phy=1)
 在控制器建立同步期间保持扫描：
 
 ```py
+sync = None
 async with aioble.scan(0, extended=True) as scanner:
     async for result in scanner:
-        if result.periodic_interval and 0 <= result.sid <= 15:
-            sync = await aioble.periodic_sync(result, timeout_ms=10000)
+        # 与上面的广播用例配对；实际应用还应按 result.device 地址筛选发送端。
+        if result.periodic_interval and result.sid == 3:
+            sync = await aioble.periodic_sync(
+                result, timeout_ms=10000, sync_timeout_ms=10000,
+            )
             break
 
-async with sync:
-    try:
-        async for report in sync:
-            if report.data_status == 0:
-                print(report.adv_data, report.rssi, report.tx_power)
-    except aioble.PeriodicSyncLostError as error:
-        print("Sync lost", error.reason)
+    if sync is not None:
+        async with sync:
+            await scanner.cancel()     # 先接管同步对象的清理，再停止发现扫描
+            print(sync.device, sync.sid, sync.periodic_interval * 1.25, sync.phy)
+            try:
+                async for report in sync:
+                    if report.data_status == 0:
+                        print(report.adv_data, report.rssi, report.tx_power)
+                    else:
+                        print("周期数据不完整", report.data_status)
+            except aioble.PeriodicSyncLostError as error:
+                print("同步丢失", error.reason)
 ```
 
-`periodic_sync(device_or_scan_result, *, sid=None, skip=0, timeout_ms=10000,
+`scan(0, ...)` 会一直等待匹配的发送端；可通过取消所在任务结束等待。
+泛用发现可改成 `result.periodic_interval and 0 <= result.sid <= 15`，
+不要对 SID 为 255 的传统广播调用周期同步。同步建立后可以停止扫描，
+周期数据接收不依赖扫描器继续运行。接收循环内 `break` 会通过上下文关闭同步。
+
+`periodic_sync(device, *, sid=None, skip=0, timeout_ms=10000,
 sync_timeout_ms=10000)` 接受带有显式 SID 的 `Device` 或扩展的 `ScanResult`，并返回 `PeriodicSync`。
 `timeout_ms` 是本地 asyncio 截止时间；`sync_timeout_ms` 是控制器超时时间（100..163840ms）。
+本地超时引发 `asyncio.TimeoutError`；控制器返回创建失败状态时引发 `OSError(status)`。
+`skip` 范围为 0..499，表示同步后允许跳过的周期广播事件数；默认 0，不跳过。
 同一时间只能有一个同步创建操作处于等待状态；已建立的同步通过句柄路由。
 由于使用显式地址，因此不受 SDK 广播者列表重试限制影响。
+
+已知发送端地址和 SID 时，可以直接指定 `Device`，并显式关闭已建立的同步：
+
+```py
+device = aioble.Device(aioble.ADDR_PUBLIC, "aa:bb:cc:dd:ee:ff")
+async with aioble.scan(0, extended=True) as scanner:
+    sync = await aioble.periodic_sync(
+        device, sid=3, skip=1, timeout_ms=10000, sync_timeout_ms=5000,
+    )
+    try:
+        await scanner.cancel()
+        print(sync.is_synced(), sync.device, sync.sid, sync.phy)
+        # 可在这里按上面的方式迭代报告。
+    finally:
+        await sync.close(timeout_ms=1000)
+```
+
+如果发送端的主 PHY 为 Coded，创建期间的扫描也需包含
+`phys=aioble.PHY_1M_MASK | aioble.PHY_CODED_MASK`，或只选择 Coded。
 
 同步对象提供 `device`、`sid`、`periodic_interval`（1.25ms 单位）、`phy`、
 `is_synced()` 和 `await close(timeout_ms=1000)`。
 报告提供 `adv_data`、`data_status`、`rssi` 和 `tx_power`。
 完整的片段链会被组装；截断/失败的报告的 `adv_data=None`，并保留其状态。
+`data_status=0` 为完整、1 为还有片段、2 为截断、3 为接收失败；
+迭代器暂存状态 1 的片段，只在片段链结束后返回报告，完整数据上限同样为 1650 字节。
 关闭操作会等待同步丢失事件。
 当另一个创建操作处于等待状态时，不要关闭已建立的同步：NimBLE 会以忙错误拒绝终止操作。
 
