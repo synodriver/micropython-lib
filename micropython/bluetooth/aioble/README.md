@@ -314,6 +314,7 @@ The new firmware APIs map to aioble as follows:
 | Firmware API | aioble usage |
 | --- | --- |
 | `ble5_features()` | `aioble.ble5_features()` |
+| `gap_set_tx_power(power_type, handle, power_level)` | `aioble.set_tx_power(power_type, handle, power_level)`; `connection.set_tx_power(power_level)` for a connection |
 | `gap_set_phy(None, ...)` | `aioble.set_default_phy(tx_phys, rx_phys)` |
 | `gap_phy()` / `gap_set_phy(conn_handle, ...)` | `connection.phy()` / `await connection.set_phy(...)` |
 | `gap_scan_ext()` | `aioble.scan(..., extended=True, phys=...)`; exit the context or `await scanner.cancel()` to stop scanning |
@@ -334,6 +335,7 @@ on the peer. On older firmware the query returns legacy capabilities (1M,
 | `phys` | Supported PHY mask; test Coded support with `features["phys"] & aioble.PHY_CODED_MASK` |
 | `extended_advertising` | Whether extended advertising is enabled |
 | `periodic_advertising` | Whether periodic advertising is enabled; synchronisation also requires the corresponding firmware API |
+| `tx_power` | Whether the enhanced transmit-power setter is available; use `.get("tx_power", False)` with earlier firmware |
 | `advertising_instances` | Total instances, including instance 0 reserved for legacy advertising; provided when extended advertising is enabled |
 | `max_adv_data_len` | Configured advertising payload limit, rather than the limit of one AD field; provided when extended advertising is enabled |
 
@@ -419,6 +421,59 @@ so a late completion cannot satisfy a subsequent request. Callers can catch
 Failed BLE 5 IRQ operations
 raise `OSError(status)` with the raw NimBLE status; immediate method failures
 retain the port's errno mapping.
+
+#### Transmit power
+
+`aioble.set_tx_power(power_type, handle, power_level)` enables BLE automatically
+and synchronously calls the ESP32 firmware's `gap_set_tx_power()` wrapper around
+`esp_ble_tx_power_set_enhanced()`. It returns `None` on success. It does not
+require `await` or emit a completion IRQ. The wrapper is available on this
+project's BLE5-enabled S3/C2/C3/C5/C6/H2 firmware, including builds with extended
+or periodic advertising disabled. Older or unsupported firmware raises
+`NotImplementedError`; constants remain available so importing aioble works.
+
+| Power type | Handle |
+| --- | --- |
+| `aioble.TX_POWER_TYPE_DEFAULT` | 0; default for types without an individually configured power |
+| `aioble.TX_POWER_TYPE_ADV` | Local advertising instance: 0 for legacy advertising, or the extended `instance`, not SID |
+| `aioble.TX_POWER_TYPE_SCAN` | 0; active scan requests |
+| `aioble.TX_POWER_TYPE_INIT` | 0; connection initiation |
+| `aioble.TX_POWER_TYPE_CONN` | An established connection's numeric handle, not a periodic-sync handle |
+
+In IDF v5.5.5, C2/C5/C6/H2 map INIT to SCAN, so these two types share their
+power setting. S3/C3 pass the two types separately. The wrapper preserves SDK behavior.
+
+Power levels are **SDK indices, not dBm numbers**. Use
+`TX_POWER_N24/N21/N18/N15/N12/N9/N6/N3/N0` for -24 through 0 dBm (indices 0..8),
+or `TX_POWER_P3/P6/P9/P12/P15/P18/P20` for +3 through +20 dBm (indices 9..15).
+For example, `aioble.TX_POWER_N0` is 8; passing the number 0 requests -24 dBm.
+C6 only accepts indices 3..15 (-15..+20 dBm); passing N24/N21/N18 raises
+`ValueError`. aioble defines these constants on all firmware for import compatibility,
+but C6's `bluetooth` module omits the three unsupported constants.
+The controller applies chip and PHY limits; a +20 dBm request does not guarantee
+that actual output. S3/C3 use 3 dBm steps and may apply 0..2 dBm less than requested.
+
+```py
+if aioble.ble5_features().get("tx_power", False):
+    aioble.set_tx_power(aioble.TX_POWER_TYPE_DEFAULT, 0, aioble.TX_POWER_P3)
+    aioble.set_tx_power(aioble.TX_POWER_TYPE_SCAN, 0, aioble.TX_POWER_N0)
+    aioble.set_tx_power(aioble.TX_POWER_TYPE_ADV, 0, aioble.TX_POWER_P9)
+```
+
+For an established `connection`, use `connection.set_tx_power(aioble.TX_POWER_P3)`.
+It checks that the connection is still current before submitting, and raises
+`DeviceDisconnectedError` on a disconnected or replaced connection. The module
+helper accepts numeric handles and does not track connection identity or
+advertising ownership. When setting an extended instance's power,
+call it after that instance has started, while its advertising task or periodic
+advertising context is still active. Reapply as needed after removing or
+reconfiguring an instance, or restarting BLE.
+
+Arguments must be integers. Out-of-range types (0..4), handles (0..65535),
+levels (0..15, or 3..15 on C6), or nonzero DEFAULT/SCAN/INIT handles raise `ValueError` in firmware
+before calling the SDK. SDK failures propagate as `OSError` using the ESP32
+port's existing ESP-IDF error handling. This changes local transmit power,
+not the peer's power or any TX Power AD field in the advertising payload.
 
 #### Extended scanning
 

@@ -296,6 +296,7 @@ aioble 自动启用 BLE，并负责 IRQ 分发。使用它时不要另行调用
 | 固件 API | aioble 用法 |
 | --- | --- |
 | `ble5_features()` | `aioble.ble5_features()` |
+| `gap_set_tx_power(power_type, handle, power_level)` | `aioble.set_tx_power(power_type, handle, power_level)`；连接可用 `connection.set_tx_power(power_level)` |
 | `gap_set_phy(None, ...)` | `aioble.set_default_phy(tx_phys, rx_phys)` |
 | `gap_phy()` / `gap_set_phy(conn_handle, ...)` | `connection.phy()` / `await connection.set_phy(...)` |
 | `gap_scan_ext()` | `aioble.scan(..., extended=True, phys=...)`；退出上下文或 `await scanner.cancel()` 停止扫描 |
@@ -314,6 +315,7 @@ aioble 自动启用 BLE，并负责 IRQ 分发。使用它时不要另行调用
 | `phys` | 支持的 PHY 掩码，可用 `features["phys"] & aioble.PHY_CODED_MASK` 检查 Coded |
 | `extended_advertising` | 是否启用扩展广播 |
 | `periodic_advertising` | 是否启用周期广播功能；周期同步还需要对应固件 API |
+| `tx_power` | 是否提供增强发射功率设置接口；兼容此前固件时使用 `.get("tx_power", False)` |
 | `advertising_instances` | 实例总数，包含保留给传统广播的实例 0；启用扩展广播时提供 |
 | `max_adv_data_len` | 固件配置的广播载荷上限，不是单个 AD 字段的上限；启用扩展广播时提供 |
 
@@ -385,6 +387,52 @@ PHY、MTU、GATT、配对和 L2CAP 操作会在发送命令前拒绝过期连接
 因此延迟完成不会满足后续请求。调用者可捕获 `asyncio.TimeoutError`，不要立即重复提交。
 失败的 BLE 5 IRQ 操作会以原始 NimBLE 状态引发 `OSError(status)`；
 方法立即失败时仍保留端口的 errno 映射。
+
+#### 发射功率
+
+`aioble.set_tx_power(power_type, handle, power_level)` 自动启用 BLE，同步调用
+ESP32 固件的 `gap_set_tx_power()`，底层为 `esp_ble_tx_power_set_enhanced()`。
+成功返回 `None`，不需要 `await`，也没有完成 IRQ。本项目启用 BLE5 的
+S3/C2/C3/C5/C6/H2 固件提供此接口；关闭扩展或周期广播的 BLE5 构建也可使用。
+旧固件或不支持的固件调用时抛出 `NotImplementedError`；常量仍可用，不影响导入 aioble。
+
+| 功率类型 | 句柄 |
+| --- | --- |
+| `aioble.TX_POWER_TYPE_DEFAULT` | 0；用于尚未单独设置功率的类型的默认值 |
+| `aioble.TX_POWER_TYPE_ADV` | 本机广播实例：传统广播为 0，扩展广播为 `instance`，不是 SID |
+| `aioble.TX_POWER_TYPE_SCAN` | 0；主动扫描请求 |
+| `aioble.TX_POWER_TYPE_INIT` | 0；发起连接 |
+| `aioble.TX_POWER_TYPE_CONN` | 已建立连接的数值句柄，不是周期同步句柄 |
+
+IDF v5.5.5 的 C2/C5/C6/H2 将 INIT 映射到 SCAN，二者共享功率设置，不能
+分别保持两个值；S3/C3 分别转交对应类型。此封装保留 SDK 行为。
+
+功率档位是 **SDK 索引，不是 dBm 数值**。使用
+`TX_POWER_N24/N21/N18/N15/N12/N9/N6/N3/N0` 请求 -24..0 dBm（索引 0..8），
+使用 `TX_POWER_P3/P6/P9/P12/P15/P18/P20` 请求 +3..+20 dBm（索引 9..15）。
+例如 `aioble.TX_POWER_N0` 为 8；传入数值 0 会请求 -24 dBm。
+C6 只接受索引 3..15（-15..+20 dBm），传入 N24/N21/N18 会抛出 `ValueError`。
+aioble 为导入兼容始终定义这些常量，但 C6 的 `bluetooth` 模块不提供这三个常量。
+实际输出受芯片、PHY 和控制器限制，请求 +20 dBm 不代表一定达到该功率；
+S3/C3 使用 3 dBm 步进，实际功率可能比请求值低 0..2 dBm。
+
+```py
+if aioble.ble5_features().get("tx_power", False):
+    aioble.set_tx_power(aioble.TX_POWER_TYPE_DEFAULT, 0, aioble.TX_POWER_P3)
+    aioble.set_tx_power(aioble.TX_POWER_TYPE_SCAN, 0, aioble.TX_POWER_N0)
+    aioble.set_tx_power(aioble.TX_POWER_TYPE_ADV, 0, aioble.TX_POWER_P9)
+```
+
+对已建立的 `connection`，可使用 `connection.set_tx_power(aioble.TX_POWER_P3)`。
+此方法提交前检查连接是否仍为当前连接；断开或被替代时抛出 `DeviceDisconnectedError`。
+模块级辅助函数接收数值句柄，不跟踪连接身份或广播实例归属。
+设置扩展广播功率时，在实例启动后、广播任务或周期广播上下文仍然活跃时调用。
+移除或重新配置实例、重启 BLE 后应按需重新设置。
+
+参数必须是整数。类型（0..4）、句柄（0..65535）、档位（0..15，C6 为 3..15）越界，
+或 DEFAULT/SCAN/INIT 使用非零句柄时，固件会在调用 SDK 前抛出 `ValueError`。
+SDK 失败通过 ESP32 端口现有的 ESP-IDF 错误处理抛出 `OSError`。
+设置只改变本机发射功率，不改变对端功率，也不会修改广播载荷中的 TX Power AD 字段。
 
 #### 扩展扫描
 

@@ -11,6 +11,7 @@ from .core import ble, register_irq_handler, log_error, _ble5_method
 
 _IRQ_MTU_EXCHANGED = const(21)
 _IRQ_PHY_UPDATE = const(40)
+_TX_POWER_TYPE_CONN = const(4)
 
 
 # Raised by `with device.timeout()`.
@@ -311,6 +312,12 @@ class DeviceConnection:
     def phy(self):
         self._assert_connected()
         return _ble5_method("gap_phy")(self._conn_handle)
+
+    def set_tx_power(self, power_level):
+        self._assert_connected()
+        return _ble5_method("gap_set_tx_power")(
+            _TX_POWER_TYPE_CONN, self._conn_handle, power_level
+        )
 
     async def set_phy(self, tx_phys, rx_phys, *, coded=0, timeout_ms=1000):
         self._assert_connected()
