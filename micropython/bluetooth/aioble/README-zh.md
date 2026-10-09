@@ -297,6 +297,7 @@ aioble 自动启用 BLE，并负责 IRQ 分发。使用它时不要另行调用
 | --- | --- |
 | `ble5_features()` | `aioble.ble5_features()` |
 | `gap_set_tx_power(power_type, handle, power_level)` | `aioble.set_tx_power(power_type, handle, power_level)`；连接可用 `connection.set_tx_power(power_level)` |
+| `gap_get_tx_power(power_type, handle)` | `aioble.get_tx_power(power_type, handle)`；连接可用 `connection.get_tx_power()` |
 | `gap_set_phy(None, ...)` | `aioble.set_default_phy(tx_phys, rx_phys)` |
 | `gap_phy()` / `gap_set_phy(conn_handle, ...)` | `connection.phy()` / `await connection.set_phy(...)` |
 | `gap_scan_ext()` | `aioble.scan(..., extended=True, phys=...)`；退出上下文或 `await scanner.cancel()` 停止扫描 |
@@ -315,7 +316,8 @@ aioble 自动启用 BLE，并负责 IRQ 分发。使用它时不要另行调用
 | `phys` | 支持的 PHY 掩码，可用 `features["phys"] & aioble.PHY_CODED_MASK` 检查 Coded |
 | `extended_advertising` | 是否启用扩展广播 |
 | `periodic_advertising` | 是否启用周期广播功能；周期同步还需要对应固件 API |
-| `tx_power` | 是否提供增强发射功率设置接口；兼容此前固件时使用 `.get("tx_power", False)` |
+| `tx_power_set` | 是否提供增强发射功率设置接口；旧固件可能缺少此键，使用 `.get("tx_power_set", False)` 检查 |
+| `tx_power_get` | 是否提供增强发射功率读取接口；兼容此前固件时使用 `.get("tx_power_get", False)` |
 | `advertising_instances` | 实例总数，包含保留给传统广播的实例 0；启用扩展广播时提供 |
 | `max_adv_data_len` | 固件配置的广播载荷上限，不是单个 AD 字段的上限；启用扩展广播时提供 |
 
@@ -417,7 +419,7 @@ aioble 为导入兼容始终定义这些常量，但 C6 的 `bluetooth` 模块�
 S3/C3 使用 3 dBm 步进，实际功率可能比请求值低 0..2 dBm。
 
 ```py
-if aioble.ble5_features().get("tx_power", False):
+if aioble.ble5_features().get("tx_power_set", False):
     aioble.set_tx_power(aioble.TX_POWER_TYPE_DEFAULT, 0, aioble.TX_POWER_P3)
     aioble.set_tx_power(aioble.TX_POWER_TYPE_SCAN, 0, aioble.TX_POWER_N0)
     aioble.set_tx_power(aioble.TX_POWER_TYPE_ADV, 0, aioble.TX_POWER_P9)
@@ -433,6 +435,26 @@ if aioble.ble5_features().get("tx_power", False):
 或 DEFAULT/SCAN/INIT 使用非零句柄时，固件会在调用 SDK 前抛出 `ValueError`。
 SDK 失败通过 ESP32 端口现有的 ESP-IDF 错误处理抛出 `OSError`。
 设置只改变本机发射功率，不改变对端功率，也不会修改广播载荷中的 TX Power AD 字段。
+
+`aioble.get_tx_power(power_type, handle)` 自动启用 BLE，经固件同步调用
+`esp_ble_tx_power_get_enhanced()`，类型和句柄约束与设置接口相同。
+返回本机当前 SDK 功率档位索引（0..15，C6 为 3..15）；SDK 报告无效或不可用值
+（包括负错误值）时返回 `None`。此结果不代表实测射频输出。
+`connection.get_tx_power()` 自动使用当前连接句柄；已断开或被替代的连接抛出
+`DeviceDisconnectedError`。固件缺少方法时抛出 `NotImplementedError`，其他参数校验
+及异常由固件透传。这两个方法均不需要 `await`。
+`tx_power_set` 表示设置能力，读取能力通过 `tx_power_get` 单独检查。
+设置能力字段由 `tx_power` 更名为 `tx_power_set`，当前固件不保留旧键别名。
+aioble 直接返回固件能力字典，因此旧固件仍可能返回旧键。
+
+```py
+if aioble.ble5_features().get("tx_power_get", False):
+    level = aioble.get_tx_power(aioble.TX_POWER_TYPE_DEFAULT, 0)
+    if level is not None:
+        print("TX power level:", level)
+    # 已建立连接时：
+    # level = connection.get_tx_power()
+```
 
 #### 扩展扫描
 

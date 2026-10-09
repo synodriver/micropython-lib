@@ -315,6 +315,7 @@ The new firmware APIs map to aioble as follows:
 | --- | --- |
 | `ble5_features()` | `aioble.ble5_features()` |
 | `gap_set_tx_power(power_type, handle, power_level)` | `aioble.set_tx_power(power_type, handle, power_level)`; `connection.set_tx_power(power_level)` for a connection |
+| `gap_get_tx_power(power_type, handle)` | `aioble.get_tx_power(power_type, handle)`; `connection.get_tx_power()` for a connection |
 | `gap_set_phy(None, ...)` | `aioble.set_default_phy(tx_phys, rx_phys)` |
 | `gap_phy()` / `gap_set_phy(conn_handle, ...)` | `connection.phy()` / `await connection.set_phy(...)` |
 | `gap_scan_ext()` | `aioble.scan(..., extended=True, phys=...)`; exit the context or `await scanner.cancel()` to stop scanning |
@@ -335,7 +336,8 @@ on the peer. On older firmware the query returns legacy capabilities (1M,
 | `phys` | Supported PHY mask; test Coded support with `features["phys"] & aioble.PHY_CODED_MASK` |
 | `extended_advertising` | Whether extended advertising is enabled |
 | `periodic_advertising` | Whether periodic advertising is enabled; synchronisation also requires the corresponding firmware API |
-| `tx_power` | Whether the enhanced transmit-power setter is available; use `.get("tx_power", False)` with earlier firmware |
+| `tx_power_set` | Whether the enhanced transmit-power setter is available; use `.get("tx_power_set", False)` because earlier firmware may omit this key |
+| `tx_power_get` | Whether the enhanced transmit-power getter is available; use `.get("tx_power_get", False)` with earlier firmware |
 | `advertising_instances` | Total instances, including instance 0 reserved for legacy advertising; provided when extended advertising is enabled |
 | `max_adv_data_len` | Configured advertising payload limit, rather than the limit of one AD field; provided when extended advertising is enabled |
 
@@ -454,7 +456,7 @@ The controller applies chip and PHY limits; a +20 dBm request does not guarantee
 that actual output. S3/C3 use 3 dBm steps and may apply 0..2 dBm less than requested.
 
 ```py
-if aioble.ble5_features().get("tx_power", False):
+if aioble.ble5_features().get("tx_power_set", False):
     aioble.set_tx_power(aioble.TX_POWER_TYPE_DEFAULT, 0, aioble.TX_POWER_P3)
     aioble.set_tx_power(aioble.TX_POWER_TYPE_SCAN, 0, aioble.TX_POWER_N0)
     aioble.set_tx_power(aioble.TX_POWER_TYPE_ADV, 0, aioble.TX_POWER_P9)
@@ -474,6 +476,29 @@ levels (0..15, or 3..15 on C6), or nonzero DEFAULT/SCAN/INIT handles raise `Valu
 before calling the SDK. SDK failures propagate as `OSError` using the ESP32
 port's existing ESP-IDF error handling. This changes local transmit power,
 not the peer's power or any TX Power AD field in the advertising payload.
+
+`aioble.get_tx_power(power_type, handle)` automatically enables BLE and synchronously
+calls `esp_ble_tx_power_get_enhanced()` through the firmware. It uses the same types
+and handles as the setter. It returns the current local SDK power-level index
+(0..15, or 3..15 on C6), or `None` when the SDK reports an invalid/unavailable value,
+including negative error values. This is not a measurement of actual RF output.
+For a current connection, `connection.get_tx_power()` supplies its handle and
+rejects disconnected or replaced connections with `DeviceDisconnectedError`.
+Missing firmware methods raise `NotImplementedError`; argument validation and
+exceptions otherwise propagate from the firmware. These methods do not require `await`.
+The `tx_power_set` capability indicates setter support; check `tx_power_get` separately.
+The setter capability was renamed from `tx_power` to `tx_power_set`; current firmware
+does not provide the old key as an alias. aioble forwards the firmware's capability
+dictionary, so older firmware may still return the old key.
+
+```py
+if aioble.ble5_features().get("tx_power_get", False):
+    level = aioble.get_tx_power(aioble.TX_POWER_TYPE_DEFAULT, 0)
+    if level is not None:
+        print("TX power level:", level)
+    # For an established connection:
+    # level = connection.get_tx_power()
+```
 
 #### Extended scanning
 

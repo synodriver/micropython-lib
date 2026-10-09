@@ -319,6 +319,10 @@ class DeviceConnection:
             _TX_POWER_TYPE_CONN, self._conn_handle, power_level
         )
 
+    def get_tx_power(self):
+        self._assert_connected()
+        return _ble5_method("gap_get_tx_power")(_TX_POWER_TYPE_CONN, self._conn_handle)
+
     async def set_phy(self, tx_phys, rx_phys, *, coded=0, timeout_ms=1000):
         self._assert_connected()
         method = _ble5_method("gap_set_phy")

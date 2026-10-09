@@ -14,6 +14,7 @@ from .core import (
     ble5_features,
     set_default_phy,
     set_tx_power,
+    get_tx_power,
 )
 
 try:

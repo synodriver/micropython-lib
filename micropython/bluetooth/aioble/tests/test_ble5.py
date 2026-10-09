@@ -42,6 +42,7 @@ class FakeBLE:
         self.handler = None
         self.calls = []
         self.fail = {}
+        self.tx_power_level = 9
         self.fail_by_instance = {}
         self.complete_sync_on_cancel = True
         self.defer_scan_stop = False
@@ -73,7 +74,8 @@ class FakeBLE:
             "phys": 7,
             "extended_advertising": True,
             "periodic_advertising": True,
-            "tx_power": True,
+            "tx_power_set": True,
+            "tx_power_get": True,
             "advertising_instances": 3,
             "max_adv_data_len": 1650,
         }
@@ -88,7 +90,7 @@ class FakeBLE:
             name.endswith("_ext")
             or "periodic" in name
             or "phy" in name
-            or name == "gap_set_tx_power"
+            or name in ("gap_set_tx_power", "gap_get_tx_power")
         )
         if not name.startswith(("gap_", "gattc_", "gatts_", "l2cap_", "config")) or (
             extended and not self.modern
@@ -118,6 +120,8 @@ class FakeBLE:
                         del self.fail[name]
                     raise error
                 raise self.fail.pop(name)
+            if name == "gap_get_tx_power":
+                return self.tx_power_level
             if name == "gap_advertise_ext":
                 self.extended_instances.add(instance)
             elif name == "gap_periodic_advertise":
@@ -248,7 +252,7 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(self.ble.enabled)
         self.assertEqual(self.ble.calls[-1], ("gap_set_tx_power", (0, 0, 8), {}))
-        self.assertTrue(self.aioble.ble5_features()["tx_power"])
+        self.assertTrue(self.aioble.ble5_features()["tx_power_set"])
         for power_type, handle, power_level in ((1, 2, 11), (2, 0, 0), (3, 0, 15), (4, 513, 9)):
             self.aioble.set_tx_power(power_type, handle, power_level)
             self.assertEqual(
@@ -263,13 +267,54 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result.exception, error)
         self.aioble.set_tx_power(self.aioble.TX_POWER_TYPE_ADV, 1, self.aioble.TX_POWER_P9)
 
+    async def test_get_tx_power_enables_ble_and_forwards_arguments(self):
+        self.assertFalse(self.ble.enabled)
+        self.assertEqual(
+            self.aioble.get_tx_power(self.aioble.TX_POWER_TYPE_DEFAULT, 0),
+            self.aioble.TX_POWER_P3,
+        )
+        self.assertTrue(self.ble.enabled)
+        self.assertEqual(self.ble.calls[-1], ("gap_get_tx_power", (0, 0), {}))
+        for power_type, handle in ((1, 2), (2, 0), (3, 0), (4, 513)):
+            self.assertEqual(self.aioble.get_tx_power(power_type, handle), self.aioble.TX_POWER_P3)
+            self.assertEqual(self.ble.calls[-1], ("gap_get_tx_power", (power_type, handle), {}))
+
+    async def test_get_tx_power_missing_on_old_or_intermediate_firmware(self):
+        for modern in (False, True):
+            self.load_aioble(modern)
+            if modern:
+                self.ble.gap_get_tx_power = None
+                features = self.ble.ble5_features()
+                del features["tx_power_get"]
+                self.ble.ble5_features = lambda: features
+            with self.assertRaises(NotImplementedError):
+                self.aioble.get_tx_power(0, 0)
+            self.assertFalse(self.ble.enabled)
+            self.assertEqual(self.ble.calls, [])
+            self.assertFalse(self.aioble.ble5_features().get("tx_power_get", False))
+
+    async def test_get_tx_power_preserves_results_and_errors(self):
+        self.assertTrue(self.aioble.ble5_features()["tx_power_get"])
+        connection = await self.aioble.Device(0, b"abcdef").connect()
+        for level in (0, 3, 15, None):
+            self.ble.tx_power_level = level
+            self.assertEqual(self.aioble.get_tx_power(0, 0), level)
+            self.assertEqual(connection.get_tx_power(), level)
+        for call in (lambda: self.aioble.get_tx_power(0, 0), connection.get_tx_power):
+            error = OSError(19)
+            self.ble.fail["gap_get_tx_power"] = error
+            with self.assertRaises(OSError) as result:
+                call()
+            self.assertIs(result.exception, error)
+        await connection.disconnect()
+
     async def test_set_tx_power_missing_on_old_or_intermediate_firmware(self):
         for modern in (False, True):
             self.load_aioble(modern)
             if modern:
                 self.ble.gap_set_tx_power = None
             else:
-                self.assertFalse(self.aioble.ble5_features()["tx_power"])
+                self.assertFalse(self.aioble.ble5_features()["tx_power_set"])
             with self.assertRaises(NotImplementedError):
                 self.aioble.set_tx_power(0, 0, 8)
             self.assertFalse(self.ble.enabled)
@@ -285,6 +330,26 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(self.aioble.DeviceDisconnectedError):
             connection.set_tx_power(self.aioble.TX_POWER_N0)
         self.assertEqual(len(self.ble.calls), calls)
+
+    async def test_connection_get_tx_power_and_disconnect(self):
+        connection = await self.aioble.Device(0, b"abcdef").connect()
+        handle = connection._conn_handle
+        self.assertEqual(connection.get_tx_power(), self.aioble.TX_POWER_P3)
+        self.assertEqual(self.ble.calls[-1], ("gap_get_tx_power", (4, handle), {}))
+        await connection.disconnect()
+        calls = len(self.ble.calls)
+        with self.assertRaises(self.aioble.DeviceDisconnectedError):
+            connection.get_tx_power()
+        self.assertEqual(len(self.ble.calls), calls)
+
+    async def test_connection_get_tx_power_on_old_firmware(self):
+        self.load_aioble(False)
+        connection = await self.aioble.Device(0, b"abcdef").connect()
+        calls = len(self.ble.calls)
+        with self.assertRaises(NotImplementedError):
+            connection.get_tx_power()
+        self.assertEqual(len(self.ble.calls), calls)
+        await connection.disconnect()
 
     async def test_connection_set_tx_power_on_old_firmware(self):
         self.load_aioble(False)
@@ -578,6 +643,8 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
             old_connection.phy()
         with self.assertRaises(self.aioble.DeviceDisconnectedError):
             old_connection.set_tx_power(self.aioble.TX_POWER_P3)
+        with self.assertRaises(self.aioble.DeviceDisconnectedError):
+            old_connection.get_tx_power()
         with self.assertRaises(self.aioble.DeviceDisconnectedError):
             await old_connection.set_phy(2, 2, timeout_ms=10)
         with self.assertRaises(ValueError):

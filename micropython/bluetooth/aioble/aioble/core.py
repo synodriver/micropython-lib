@@ -60,7 +60,8 @@ def ble5_features():
         "phys": 1,
         "extended_advertising": False,
         "periodic_advertising": False,
-        "tx_power": False,
+        "tx_power_set": False,
+        "tx_power_get": False,
         "advertising_instances": 1,
         "max_adv_data_len": 31,
     }
@@ -72,6 +73,10 @@ def set_default_phy(tx_phys, rx_phys):
 
 def set_tx_power(power_type, handle, power_level):
     return _ble5_method("gap_set_tx_power")(power_type, handle, power_level)
+
+
+def get_tx_power(power_type, handle):
+    return _ble5_method("gap_get_tx_power")(power_type, handle)
 
 
 # Because different functionality is enabled by which files are available the
