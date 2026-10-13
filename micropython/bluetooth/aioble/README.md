@@ -539,13 +539,91 @@ and scan response data. Incomplete fragments are withheld. Truncated or
 oversized chains produce `data_status=2` with the affected payload set to
 `None`; they are never parsed as complete advertising data. The assembled
 payload limit is 1650 bytes. Address and payload memoryviews are copied during
-the IRQ. Queued scan results and periodic reports should be consumed promptly;
-their queues grow if the application cannot keep up.
+the IRQ. Scan buffering is bounded as described below. Periodic reports still
+need prompt consumption; their queues are not covered by these scan limits.
 The scanner yields the same `ScanResult` object again as it changes. Copy the
 fields you need when storing historical results rather than keeping only an
 object reference. `data_status` describes the most recent report; advertising
 and response payloads are stored separately in `adv_data` and `resp_data`.
 Check whether the relevant payload is `None` before parsing it.
+
+#### Scan lifetime and memory limits (legacy and extended)
+
+MicroPython's `asyncio.run()` can exit on Ctrl+C while a coroutine is suspended,
+without executing its `async with` cleanup. An indefinite scan can then continue
+at the REPL. Keep synchronous cleanup **outside** `asyncio.run()`:
+
+```py
+scanner = aioble.scan(0, extended=True)
+
+async def main():
+    async with scanner:
+        async for result in scanner:
+            print(result.device, result.sid)
+
+try:
+    asyncio.run(main())
+finally:
+    scanner.close()
+```
+
+`scanner.close()` synchronously requests scan termination, discards queued
+reports and releases the scanner's result/fragment cache. It is idempotent and
+does not disable BLE, advertising, connections or periodic syncs. On backends
+that deliver scan completion asynchronously, the scanner retains ownership
+until that event arrives; `await scanner.cancel()` also waits for it. A new
+aioble scan or connection waits for the previous scan's completion as before.
+A failed stop command raises its SDK error and retains ownership for a later
+`close()`/`cancel()` retry, while incoming reports are discarded. Closing an old
+scanner cannot stop its replacement. Create a new scanner for each session.
+Closing a scanner while it waits for an old scan to stop also prevents it from
+starting afterwards.
+
+For an application that owns all BLE activity, `aioble.stop()` in the outer
+`finally` is another option: it disables BLE and invokes all shutdown handlers.
+Neither an inner coroutine `finally` nor garbage collection replaces this
+outer cleanup. These APIs do not resume or dispose of abandoned asyncio tasks.
+
+`scan()` has three new keyword-only positive integer limits:
+
+| Argument | Default | Scope |
+| --- | --- | --- |
+| `max_queue` | 32 | Pending reports, including individual extended fragments |
+| `max_queue_bytes` | 8192 | Sum of payload bytes in pending reports |
+| `max_results` | 32 | Distinct address type/address/SID results retained per scan |
+
+Legacy results use address type/address. Repeated reports reuse the same result
+object; results are not silently evicted. The byte limit excludes Python object
+overhead and result caches. Each extended result can also retain advertising,
+response and partial payloads, subject to the 1650-byte chain limit. Choose
+limits for available heap and device density; application-owned references are
+outside these limits. Filtering after iteration does not avoid cache entries.
+
+Exceeding a limit terminates the scan and discards its backlog/partial chains.
+The iterator raises `MemoryError("scan queue limit exceeded")` or
+`MemoryError("scan result limit exceeded")`. IRQ payload-copy/queue allocation
+failure is contained and reported as `MemoryError("scan buffer allocation failed")`
+to the consumer. No incomplete chain is continued after dropping a fragment.
+Already returned results retain their published payloads; internal partial
+chains are cleared. Natural scan timeout still drains queued reports normally.
+If result creation or fragment assembly raises `MemoryError` in the consumer,
+the scanner also closes, clears its caches and schedules a stop before
+re-raising the original exception. Catching it inside the scan context does not
+allow the scan to keep collecting reports.
+
+On IRQ overflow, stopping is deferred through `micropython.schedule`, not an
+asyncio task or a reentrant controller call. It can therefore run at VM safe
+points at the REPL after Ctrl+C. A full scheduler or failed stop is retried on
+subsequent reports; meanwhile incoming reports are discarded. If no further
+report arrives, explicit cleanup is needed. This is a bounded-memory fallback,
+not immediate detection of Ctrl+C: use the outer `finally` for prompt shutdown.
+It also requires the VM to service scheduled callbacks. Severe unrelated heap
+exhaustion and application code that never yields remain outside this guarantee.
+
+Existing positional arguments and ordinary scan/result semantics are unchanged.
+The finite defaults intentionally replace unbounded growth: dense or slow scans
+may now raise an explicit limit error. Increase the limits deliberately or use
+shorter scan sessions; increasing them does not make a slow consumer faster.
 
 #### Extended advertising
 

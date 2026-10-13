@@ -1,7 +1,7 @@
 # MicroPython aioble module
 # MIT license; Copyright (c) 2021 Jim Mussared
 
-from micropython import const
+from micropython import const, schedule
 
 import bluetooth
 import struct
@@ -47,6 +47,10 @@ _ADV_TYPE_UUID128_INCOMPLETE = const(0x6)
 _ADV_TYPE_UUID128_COMPLETE = const(0x7)
 _ADV_TYPE_APPEARANCE = const(0x19)
 _ADV_TYPE_MANUFACTURER = const(0xFF)
+
+# Avoid allocating exception-type tuples while handling an exhausted heap.
+_SCHEDULE_ERRORS = (RuntimeError, MemoryError)
+_SCAN_CLOSE_ERRORS = (OSError, MemoryError)
 
 
 # Keep track of the active scanner so IRQs can be delivered to it.
@@ -105,43 +109,17 @@ async def _cleanup_connect(connection):
 def _central_irq(event, data):
     # Send results and done events to the active scanner instance.
     if event == _IRQ_SCAN_RESULT:
-        addr_type, addr, adv_type, rssi, adv_data = data
         if not _active_scanner or _active_scanner._extended:
             return
-        _active_scanner._queue.append((addr_type, bytes(addr), adv_type, rssi, bytes(adv_data)))
-        _active_scanner._event.set()
+        _active_scanner._enqueue(data)
     elif event == _IRQ_SCAN_RESULT_EXT:
         if not _active_scanner or not _active_scanner._extended:
             return
-        # Address/data memoryviews are only valid during this IRQ.
-        addr_type, properties, primary_phy, secondary_phy, sid, periodic_interval, data_status = (
-            data[:7]
-        )
-        addr = bytes(data[7])
-        rssi, tx_power = data[8:10]
-        adv_data = bytes(data[10])
-        _active_scanner._queue.append(
-            (
-                addr_type,
-                properties,
-                primary_phy,
-                secondary_phy,
-                sid,
-                periodic_interval,
-                data_status,
-                addr,
-                rssi,
-                tx_power,
-                adv_data,
-            )
-        )
-        _active_scanner._event.set()
+        _active_scanner._enqueue(data)
     elif event == _IRQ_SCAN_DONE:
         if not _active_scanner:
             return
-        _active_scanner._done = True
-        _active_scanner._event.set()
-        _active_scanner._done_event.set()
+        _active_scanner._finish()
 
     # Peripheral connect must be in response to a pending connection, so find
     # it in the pending connection set.
@@ -177,9 +155,8 @@ def _central_irq(event, data):
 def _central_shutdown():
     global _active_scanner
     if _active_scanner:
-        _active_scanner._done = True
-        _active_scanner._event.set()
-        _active_scanner._done_event.set()
+        _active_scanner._closed = True
+        _active_scanner._finish()
     _active_scanner = None
     for connection in _connecting.values():
         connection._connect_done = True
@@ -424,11 +401,27 @@ class scan:
         *,
         extended=False,
         phys=None,
+        max_queue=32,
+        max_queue_bytes=8192,
+        max_results=32,
     ):
+        for limit in (max_queue, max_queue_bytes, max_results):
+            if not isinstance(limit, int) or limit <= 0:
+                raise ValueError("scan limits must be positive integers")
+        self._max_queue = max_queue
+        self._max_queue_bytes = max_queue_bytes
+        self._max_results = max_results
         self._queue = []
+        self._queue_bytes = 0
         self._event = asyncio.ThreadSafeFlag()
         self._done_event = asyncio.ThreadSafeFlag()
         self._done = False
+        self._closed = False
+        self._stop_requested = False
+        self._error = None
+        self._close_scheduled = False
+        # Pre-bind before an IRQ needs to schedule cleanup under memory pressure.
+        self._close_callback = self._scheduled_close
 
         # Keep track of what we've already seen.
         self._results = set()
@@ -443,11 +436,115 @@ class scan:
         self._extended = extended or phys is not None
         self._phys = 1 if phys is None else phys
 
+    def _clear(self):
+        self._queue.clear()
+        self._queue_bytes = 0
+        for result in self._results:
+            result._fragments.clear()
+        self._results.clear()
+
+    def _finish(self):
+        global _active_scanner
+        self._done = True
+        self._event.set()
+        self._done_event.set()
+        # A natural timeout still allows queued reports to be consumed.
+        if self._closed:
+            self._clear()
+            if _active_scanner is self:
+                _active_scanner = None
+
+    def _schedule_close(self):
+        if self._close_scheduled or self._done or self._stop_requested:
+            return
+        self._close_scheduled = True
+        try:
+            schedule(self._close_callback, None)
+        except _SCHEDULE_ERRORS:
+            # A full VM scheduler must not disable the global BLE IRQ handler.
+            # Retry on the next report, or via explicit close()/cancel().
+            self._close_scheduled = False
+
+    def _scheduled_close(self, _):
+        self._close_scheduled = False
+        try:
+            self.close()
+        except _SCAN_CLOSE_ERRORS:
+            # Keep ownership and discard reports until another stop attempt.
+            # Explicit close()/cancel() still reports the SDK error.
+            pass
+
+    def _fail(self, message):
+        self._error = message
+        self._closed = True
+        self._clear()
+        self._event.set()
+        # Runs at VM safe points, including the REPL, without an asyncio loop.
+        # Never call the controller stop API reentrantly from its report IRQ.
+        self._schedule_close()
+
+    def _enqueue(self, data):
+        if self._closed:
+            if self._error:
+                self._schedule_close()
+            return
+        if self._done:
+            return
+        if (
+            len(self._queue) >= self._max_queue
+            or self._queue_bytes + len(data[-1]) > self._max_queue_bytes
+        ):
+            self._fail("scan queue limit exceeded")
+            return
+        try:
+            # Address/data memoryviews are only valid during this IRQ.
+            if self._extended:
+                (
+                    addr_type,
+                    props,
+                    primary,
+                    secondary,
+                    sid,
+                    interval,
+                    status,
+                    addr,
+                    rssi,
+                    tx,
+                    adv,
+                ) = data
+                report = (
+                    addr_type,
+                    props,
+                    primary,
+                    secondary,
+                    sid,
+                    interval,
+                    status,
+                    bytes(addr),
+                    rssi,
+                    tx,
+                    bytes(adv),
+                )
+            else:
+                addr_type, addr, adv_type, rssi, adv = data
+                report = (addr_type, bytes(addr), adv_type, rssi, bytes(adv))
+            self._queue.append(report)
+            self._queue_bytes += len(report[-1])
+        except MemoryError:
+            self._fail("scan buffer allocation failed")
+            return
+        self._event.set()
+
     async def __aenter__(self):
         global _active_scanner
+        if self._closed or self._done or _active_scanner is self:
+            raise ValueError("scan already started or closed")
         ensure_active()
         scan_ext = _ble5_method("gap_scan_ext") if self._extended else None
         await _cancel_pending()
+        # close() can run while waiting for the previous scan's completion.
+        if self._closed or self._done or _active_scanner is self:
+            raise ValueError("scan already started or closed")
         _active_scanner = self
         try:
             if scan_ext:
@@ -461,8 +558,8 @@ class scan:
             else:
                 ble.gap_scan(self._duration_ms, self._interval_us, self._window_us, self._active)
         except BaseException:
-            _active_scanner = None
-            self._done = True
+            self._closed = True
+            self._finish()
             raise
         return self
 
@@ -477,64 +574,106 @@ class scan:
         return self
 
     async def __anext__(self):
-        global _active_scanner
-
-        if _active_scanner != self:
-            # The scan has been canceled (e.g. a connection was initiated).
-            raise StopAsyncIteration
-
         while True:
-            if _active_scanner != self:
+            if self._error:
+                self.close()
+                raise MemoryError(self._error)
+            if self._closed or _active_scanner is not self:
                 raise StopAsyncIteration
             while self._queue:
                 # Extended fragments must be consumed in arrival order.
-                report = self._queue.pop(0) if self._extended else self._queue.pop()
+                try:
+                    report = self._queue.pop(0) if self._extended else self._queue.pop()
+                except IndexError:
+                    # A BLE IRQ or scheduled close can clear the queue between
+                    # the loop test and pop, without an asyncio task switch.
+                    if self._closed:
+                        break
+                    raise
+                self._queue_bytes = max(0, self._queue_bytes - len(report[-1]))
+                if self._closed:
+                    break
                 if self._extended:
                     addr_type, _, _, _, sid, _, _, addr, _, _, _ = report
                 else:
+                    if self._closed:
+                        break
                     addr_type, addr, adv_type, rssi, adv_data = report
                     sid = None
 
-                # Try to find an existing ScanResult for this device.
-                for r in self._results:
-                    if r.device.addr_type == addr_type and r.device.addr == addr and r.sid == sid:
-                        result = r
-                        break
-                else:
-                    # New device, create a new Device & ScanResult.
-                    device = Device(addr_type, addr)
-                    result = ScanResult(device, sid)
-                    self._results.add(result)
+                try:
+                    # Try to find an existing ScanResult for this device.
+                    for r in self._results:
+                        if (
+                            r.device.addr_type == addr_type
+                            and r.device.addr == addr
+                            and r.sid == sid
+                        ):
+                            result = r
+                            break
+                    else:
+                        if len(self._results) >= self._max_results:
+                            self._fail("scan result limit exceeded")
+                            break
+                        # New device, create a new Device & ScanResult.
+                        device = Device(addr_type, addr)
+                        result = ScanResult(device, sid)
+                        self._results.add(result)
 
-                # Add the new information from this event.
-                updated = (
-                    result._update_extended(report)
-                    if self._extended
-                    else result._update(adv_type, rssi, adv_data)
-                )
+                    # Add the new information from this event.
+                    updated = (
+                        result._update_extended(report)
+                        if self._extended
+                        else result._update(adv_type, rssi, adv_data)
+                    )
+                except MemoryError:
+                    # Creation or fragment assembly can exhaust the heap too.
+                    # Stop even if the caller catches this inside its context.
+                    if not self._closed:
+                        self._fail("scan result allocation failed")
+                    raise
+                if self._closed:
+                    # Cleanup may have run while this report was being parsed.
+                    result._fragments.clear()
+                    self._clear()
+                    break
                 if updated:
                     # It's new information, so re-yield this result.
                     return result
 
+            if self._closed:
+                continue
             if self._done:
                 # _IRQ_SCAN_DONE event was fired.
-                _active_scanner = None
+                self.close()
                 raise StopAsyncIteration
 
             # Wait for either done or result IRQ.
             await self._event.wait()
 
+    # Synchronous cleanup also works after asyncio.run() has been interrupted.
+    # Ownership is retained until SCAN_DONE, so a late completion cannot be
+    # mistaken for the end of a replacement scan on asynchronous backends.
+    def close(self):
+        self._closed = True
+        self._clear()
+        self._event.set()
+        if _active_scanner is not self or self._done:
+            self._finish()
+            return
+        if not self._stop_requested:
+            self._stop_requested = True
+            try:
+                if self._extended:
+                    ble.gap_scan_ext(None)
+                else:
+                    ble.gap_scan(None)
+            except BaseException:
+                self._stop_requested = False
+                raise
+
     # Cancel any in-progress scan. We need to do this before starting any other operation.
     async def cancel(self):
-        global _active_scanner
-        if _active_scanner != self:
-            return
-        if not self._done:
-            if self._extended:
-                ble.gap_scan_ext(None)
-            else:
-                ble.gap_scan(None)
+        self.close()
         while not self._done:
             await self._done_event.wait()
-        if _active_scanner == self:
-            _active_scanner = None

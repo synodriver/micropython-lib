@@ -1,11 +1,15 @@
 """Host regressions for aioble's ESP32 BLE 5 adapter, using a simulated BLE API."""
 
+import ast
 import asyncio
 import importlib
 from pathlib import Path
 import sys
 import types
 import unittest
+
+
+MICROPYTHON_ASYNCIO = Path(__file__).resolve().parents[5] / "extmod/asyncio/core.py"
 
 
 class ThreadSafeFlag:
@@ -45,6 +49,7 @@ class FakeBLE:
         self.tx_power_level = 9
         self.fail_by_instance = {}
         self.complete_sync_on_cancel = True
+        self.scanning = False
         self.defer_scan_stop = False
         self.defer_connect = False
         self.defer_indicate = False
@@ -63,6 +68,7 @@ class FakeBLE:
         if value is not None:
             self.enabled = value
             if not value:
+                self.scanning = False
                 self.extended_instances.clear()
                 self.periodic_instances.clear()
         return self.enabled
@@ -131,10 +137,13 @@ class FakeBLE:
                 if kwargs.get("remove", False):
                     self.extended_instances.discard(instance)
             elif name in ("gap_scan", "gap_scan_ext") and args[0] is None:
+                self.scanning = False
                 if self.defer_scan_stop:
                     asyncio.get_running_loop().call_soon(self.emit, 6, ())
                 else:
                     self.emit(6, ())
+            elif name in ("gap_scan", "gap_scan_ext"):
+                self.scanning = True
             elif name == "gap_connect" and args[0] is not None:
                 if not self.defer_connect:
                     asyncio.get_running_loop().call_soon(self.emit, 7, (10, args[0], args[1]))
@@ -200,6 +209,8 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
         bluetooth.BLE = lambda: self.ble
         micropython = types.ModuleType("micropython")
         micropython.const = lambda value: value
+        self.scheduled = []
+        micropython.schedule = lambda callback, arg: self.scheduled.append((callback, arg))
         sys.modules["bluetooth"] = bluetooth
         sys.modules["micropython"] = micropython
         self.aioble = importlib.import_module("aioble")
@@ -218,6 +229,12 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
     async def settle(self):
         for _ in range(12):
             await asyncio.sleep(0)
+
+    def run_scheduled(self):
+        # MicroPython's scheduler runs independently of asyncio (also at REPL).
+        while self.scheduled:
+            callback, arg = self.scheduled.pop(0)
+            callback(arg)
 
     def report(self, sid=1, status=0, payload=b"\x04\x09MPY", properties=1):
         return (
@@ -442,6 +459,334 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(StopAsyncIteration):
                 await waiter
             self.assertIs(self.central._active_scanner, new)
+
+    async def test_scan_limits_validate_before_start(self):
+        for name in ("max_queue", "max_queue_bytes", "max_results"):
+            for value in (0, -1, None, 1.5):
+                with self.assertRaises(ValueError):
+                    self.aioble.scan(0, **{name: value})
+        self.assertFalse(self.ble.enabled)
+
+    async def test_scan_queue_overflow_stops_without_consumer(self):
+        for extended in (False, True):
+            scanner = await self.aioble.scan(0, extended=extended, max_queue=2).__aenter__()
+            event = 41 if extended else 5
+            report = self.report() if extended else (0, b"abcdef", 0, -40, b"abc")
+            self.ble.emit(event, report)
+            self.ble.emit(event, report)
+            self.assertEqual(len(scanner._queue), 2)
+            for _ in range(1000):
+                self.ble.emit(event, report)
+            self.assertEqual(scanner._queue, [])
+            self.assertEqual(scanner._queue_bytes, 0)
+            self.assertEqual(len(self.scheduled), 1)
+            self.assertTrue(self.ble.scanning)
+            self.run_scheduled()
+            self.assertFalse(self.ble.scanning)
+            self.assertTrue(self.ble.active())
+            self.assertIsNone(self.central._active_scanner)
+            with self.assertRaisesRegex(MemoryError, "scan queue limit exceeded"):
+                await scanner.__anext__()
+
+    async def test_scan_byte_budget_released_by_consumer(self):
+        async with self.aioble.scan(0, extended=True, max_queue_bytes=5) as scanner:
+            self.ble.emit(41, self.report())
+            await scanner.__anext__()
+            self.assertEqual(scanner._queue_bytes, 0)
+            self.ble.emit(41, self.report(sid=2))
+            await scanner.__anext__()
+            self.ble.emit(41, self.report(payload=b"123456"))
+            with self.assertRaisesRegex(MemoryError, "scan queue limit exceeded"):
+                await scanner.__anext__()
+            self.assertFalse(self.ble.scanning)
+
+    async def test_scan_result_limit_preserves_identity_until_overflow(self):
+        async with self.aioble.scan(0, extended=True, max_results=1) as scanner:
+            self.ble.emit(41, self.report())
+            first = await scanner.__anext__()
+            self.ble.emit(41, self.report(payload=b"\x04\x09TWO"))
+            self.assertIs(await scanner.__anext__(), first)
+            self.ble.emit(41, self.report(sid=2))
+            with self.assertRaisesRegex(MemoryError, "scan result limit exceeded"):
+                await scanner.__anext__()
+            self.assertFalse(self.ble.scanning)
+            self.assertFalse(scanner._results)
+            self.assertEqual(first.name(), "TWO")
+
+    async def test_scan_overflow_does_not_join_fragments_across_loss(self):
+        async with self.aioble.scan(0, extended=True, max_queue=1) as scanner:
+            self.ble.emit(41, self.report())
+            result = await scanner.__anext__()
+            waiter = asyncio.create_task(scanner.__anext__())
+            self.ble.emit(41, self.report(status=1, payload=b"prefix"))
+            await asyncio.sleep(0)
+            self.assertTrue(result._fragments)
+            self.ble.emit(41, self.report(status=1, payload=b"middle"))
+            self.ble.emit(41, self.report(payload=b"suffix"))
+            with self.assertRaises(MemoryError):
+                await waiter
+            self.assertFalse(result._fragments)
+            self.assertEqual(result.name(), "MPY")
+
+    async def test_scan_irq_allocation_failure_is_contained(self):
+        async with self.aioble.scan(0, extended=True) as scanner:
+
+            class FailingQueue(list):
+                def append(self, value):
+                    raise MemoryError
+
+            scanner._queue = FailingQueue()
+            handler = self.ble.handler
+            self.ble.emit(41, self.report())
+            self.assertIs(self.ble.handler, handler)
+            self.run_scheduled()
+            with self.assertRaisesRegex(MemoryError, "scan buffer allocation failed"):
+                await scanner.__anext__()
+
+    async def test_scan_full_scheduler_retries_on_next_report(self):
+        scanner = await self.aioble.scan(0, extended=True, max_queue=1).__aenter__()
+        original = self.central.schedule
+
+        def full(callback, arg):
+            raise RuntimeError("schedule queue full")
+
+        self.central.schedule = full
+        self.ble.emit(41, self.report())
+        self.ble.emit(41, self.report())
+        self.assertFalse(scanner._queue)
+        self.central.schedule = original
+        self.ble.emit(41, self.report())
+        self.run_scheduled()
+        self.assertFalse(self.ble.scanning)
+
+    async def test_scan_close_failure_retains_owner_for_retry(self):
+        scanner = await self.aioble.scan(0, extended=True).__aenter__()
+        self.ble.fail["gap_scan_ext"] = OSError(5)
+        with self.assertRaises(OSError):
+            scanner.close()
+        self.assertTrue(self.ble.scanning)
+        self.assertIs(self.central._active_scanner, scanner)
+        self.ble.emit(41, self.report())
+        self.assertFalse(scanner._queue)
+        await scanner.cancel()
+        self.assertFalse(self.ble.scanning)
+        self.assertIsNone(self.central._active_scanner)
+
+    async def test_scan_overflow_stop_failure_retries_without_asyncio(self):
+        scanner = await self.aioble.scan(0, extended=True, max_queue=1).__aenter__()
+        self.ble.emit(41, self.report())
+        self.ble.emit(41, self.report())
+        self.ble.fail["gap_scan_ext"] = OSError(5)
+        self.run_scheduled()
+        self.assertIs(self.central._active_scanner, scanner)
+        self.ble.emit(41, self.report())
+        self.run_scheduled()
+        self.assertFalse(self.ble.scanning)
+
+    async def test_scan_close_deferred_completion_blocks_replacement(self):
+        old = await self.aioble.scan(0, extended=True).__aenter__()
+        self.ble.defer_scan_stop = True
+        old.close()
+        old.close()
+        self.assertIs(self.central._active_scanner, old)
+        self.ble.emit(41, self.report())
+        self.assertFalse(old._queue)
+        async with self.aioble.scan(0) as new:
+            self.assertIs(self.central._active_scanner, new)
+            old.close()
+            self.assertTrue(self.ble.scanning)
+        stops = [c for c in self.ble.calls if c[:2] == ("gap_scan_ext", (None,))]
+        self.assertEqual(len(stops), 1)
+
+    async def test_scan_closed_while_waiting_for_previous_stop_does_not_start(self):
+        old = await self.aioble.scan(0, extended=True).__aenter__()
+        emit = self.ble.emit
+        self.ble.emit = lambda event, data: None if event == 6 else emit(event, data)
+        scanner = self.aioble.scan(0, extended=True)
+        task = asyncio.create_task(scanner.__aenter__())
+        await asyncio.sleep(0)
+        self.assertIs(self.central._active_scanner, old)
+        scanner.close()
+        emit(6, ())
+        with self.assertRaises(ValueError):
+            await task
+        self.assertFalse(self.ble.scanning)
+        self.assertIsNone(self.central._active_scanner)
+
+    async def test_scan_result_allocation_failure_stops_inside_context(self):
+        for extended in (False, True):
+            async with self.aioble.scan(0, extended=extended) as scanner:
+                event = 41 if extended else 5
+                report = self.report() if extended else (0, b"abcdef", 0, -40, b"abc")
+                self.ble.emit(event, report)
+                result_type = self.central.ScanResult
+
+                def no_memory(*args):
+                    raise MemoryError("result allocation failed")
+
+                self.central.ScanResult = no_memory
+                try:
+                    with self.assertRaises(MemoryError):
+                        await scanner.__anext__()
+                finally:
+                    self.central.ScanResult = result_type
+                self.run_scheduled()
+                self.assertFalse(self.ble.scanning)
+                self.assertFalse(scanner._queue)
+                self.assertFalse(scanner._results)
+                self.assertIsNone(self.central._active_scanner)
+
+    async def test_scan_fragment_allocation_failure_discards_chain_and_stops(self):
+        async with self.aioble.scan(0, extended=True) as scanner:
+            self.ble.emit(41, self.report())
+            result = await scanner.__anext__()
+
+            class NoConcat(bytes):
+                def __add__(self, other):
+                    raise MemoryError("fragment allocation failed")
+
+            result._fragments[False] = NoConcat(b"prefix")
+            self.ble.emit(41, self.report(payload=b"suffix"))
+            with self.assertRaisesRegex(MemoryError, "fragment allocation failed"):
+                await scanner.__anext__()
+            self.run_scheduled()
+            self.assertFalse(self.ble.scanning)
+            self.assertFalse(result._fragments)
+            self.assertFalse(scanner._results)
+            self.assertEqual(result.name(), "MPY")
+
+    async def test_scan_old_scheduled_close_cannot_stop_replacement(self):
+        old = await self.aioble.scan(0, extended=True, max_queue=1).__aenter__()
+        self.ble.emit(41, self.report())
+        self.ble.emit(41, self.report())
+        async with self.aioble.scan(0) as new:
+            self.run_scheduled()
+            self.assertIs(self.central._active_scanner, new)
+            self.assertTrue(self.ble.scanning)
+        with self.assertRaises(ValueError):
+            await old.__aenter__()
+
+    async def test_scan_natural_completion_drains_then_releases_cache(self):
+        async with self.aioble.scan(10, extended=True) as scanner:
+            self.ble.emit(41, self.report())
+            self.ble.emit(6, ())
+            self.ble.emit(41, self.report(sid=2))
+            result = await scanner.__anext__()
+            with self.assertRaises(StopAsyncIteration):
+                await scanner.__anext__()
+            self.assertFalse(scanner._results)
+            self.assertEqual(result.name(), "MPY")
+
+    async def test_scan_shutdown_releases_buffered_data(self):
+        scanner = await self.aioble.scan(0, extended=True).__aenter__()
+        self.ble.emit(41, self.report())
+        result = await scanner.__anext__()
+        self.ble.emit(41, self.report(sid=2))
+        self.aioble.stop()
+        self.assertFalse(scanner._queue)
+        self.assertFalse(scanner._results)
+        self.assertEqual(result.name(), "MPY")
+        scanner.close()
+
+    async def test_scan_close_during_queue_pop_ends_iteration(self):
+        for after_pop in (False, True):
+            scanner = await self.aioble.scan(0, extended=True).__aenter__()
+            self.ble.emit(41, self.report())
+
+            class ClosingQueue(list):
+                def pop(self, index=0):
+                    if after_pop:
+                        report = super().pop(index)
+                        scanner.close()
+                        return report
+                    scanner.close()
+                    return super().pop(index)
+
+            scanner._queue = ClosingQueue(scanner._queue)
+            with self.assertRaises(StopAsyncIteration):
+                await scanner.__anext__()
+            self.assertEqual(scanner._queue_bytes, 0)
+
+    async def test_scan_close_during_result_update_releases_partial_chain(self):
+        scanner = await self.aioble.scan(0, extended=True).__aenter__()
+        self.ble.emit(41, self.report())
+        result = await scanner.__anext__()
+        update = result._update_extended
+
+        def closing_update(report):
+            scanner.close()
+            return update(report)
+
+        result._update_extended = closing_update
+        self.ble.emit(41, self.report(status=1, payload=b"unfinished"))
+        with self.assertRaises(StopAsyncIteration):
+            await scanner.__anext__()
+        self.assertFalse(result._fragments)
+        self.assertFalse(scanner._results)
+
+    async def test_scan_cancelled_waiter_does_not_abandon_pending_stop(self):
+        scanner = await self.aioble.scan(0, extended=True).__aenter__()
+        emit = self.ble.emit
+        self.ble.emit = lambda event, data: None if event == 6 else emit(event, data)
+        task = asyncio.create_task(scanner.cancel())
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertIs(self.central._active_scanner, scanner)
+        emit(6, ())
+        self.assertIsNone(self.central._active_scanner)
+
+    async def test_micropython_loop_keyboard_interrupt_leaves_scan_but_bounds_backlog(self):
+        # Exercise the real MicroPython loop's polling escape, not CPython's
+        # asyncio.run(), which has different cancellation/cleanup semantics.
+        source = MICROPYTHON_ASYNCIO
+        if not source.is_file():
+            self.skipTest("requires the containing MicroPython source checkout")
+        tree = ast.parse(source.read_text())
+        tree.body = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "run_until_complete"
+        ]
+        scanner = self.aioble.scan(0, extended=True, max_queue=2)
+
+        async def consumer():
+            async with scanner:
+                async for _ in scanner:
+                    pass
+
+        coro = consumer()
+        task = types.SimpleNamespace(coro=coro, data=None, state=True, ph_key=0)
+        tasks = [task]
+
+        def poll(_):
+            if self.ble.scanning:
+                raise KeyboardInterrupt
+
+        env = {
+            "CancelledError": asyncio.CancelledError,
+            "_task_queue": types.SimpleNamespace(
+                peek=lambda: tasks[0] if tasks else None, pop=tasks.pop
+            ),
+            "_io_queue": types.SimpleNamespace(map={1: True}, wait_io_event=poll),
+            "ticks": lambda: 0,
+            "ticks_diff": lambda a, b: a - b,
+        }
+        exec(compile(tree, str(source), "exec"), env)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                env["run_until_complete"](task)
+            self.assertIs(self.central._active_scanner, scanner)
+            self.assertTrue(self.ble.scanning)
+            for _ in range(1000):
+                self.ble.emit(41, self.report())
+            self.assertFalse(scanner._queue)
+            self.run_scheduled()
+            self.assertFalse(self.ble.scanning)
+            self.assertIsNone(self.central._active_scanner)
+        finally:
+            coro.close()
 
     async def test_extended_connect_and_phy(self):
         device = self.aioble.Device(0, b"abcdef")
