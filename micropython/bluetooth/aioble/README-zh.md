@@ -639,6 +639,15 @@ finally:
 
 多个扩展实例可在独立任务中并行广播。以下两个实例各运行 10 秒；
 `advertising_instances` 至少为 3 才能使用实例 1 和 2。
+当前固件将 `CONFIG_BT_NIMBLE_MAX_EXT_ADV_INSTANCES` 设为 4，表示基础实例 0
+加四个额外实例：纯 BLE5 固件可用句柄 0～4；Mesh 固件可用句柄 0～3，物理实例 4
+由 Mesh 私有使用。能力查询分别返回 5 和 4，应按返回值选择实例。SDK 此配置上限
+就是 4，不能设置为 5。旧有句柄 0～2 不变。
+
+可选的本地 `aioble-mesh` 包提供 `from aioble.mesh import Node`，依赖 ESP32-C3/C5/C6/H2/S3
+原生 `blemesh` 固件，接受 IDF 5.5.x（≥5.5.3，C5 ≥5.5.5，推荐 5.5.5）和 6.1.x，本阶段只提供 PB-ADV 配网。
+5.5.3 开启 SDK 连接自动重试时，保留既有的周期同步限制；详见主仓库 Mesh README。
+使用方式和共存限制见父 MicroPython 仓库的 `ports/esp32/blemesh/README.md`。
 
 ```py
 async def broadcast(instance, sid, name):

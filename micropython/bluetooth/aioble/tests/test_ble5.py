@@ -82,7 +82,7 @@ class FakeBLE:
             "periodic_advertising": True,
             "tx_power_set": True,
             "tx_power_get": True,
-            "advertising_instances": 3,
+            "advertising_instances": 5,
             "max_adv_data_len": 1650,
         }
 
@@ -2260,7 +2260,7 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
         for instance, exception in (
             (0, ValueError),
             (-1, ValueError),
-            (3, ValueError),
+            (5, ValueError),
             (99, ValueError),
             (1.5, TypeError),
             ("1", TypeError),
@@ -2289,7 +2289,7 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_periodic_instance_leaves_no_cleanup_work(self):
         for instance, exception in (
             (0, ValueError),
-            (3, ValueError),
+            (5, ValueError),
             (99, ValueError),
             (1.5, TypeError),
         ):
@@ -2304,6 +2304,14 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(self.peripheral._cleanup_task)
         async with self.aioble.periodic_advertise(100000, instance=2):
             self.assertEqual(self.ble.periodic_instances, {2})
+        self.assertEqual(self.ble.extended_instances, set())
+        self.assertEqual(self.ble.periodic_instances, set())
+
+    async def test_expanded_instances_can_advertise_concurrently(self):
+        async with self.aioble.periodic_advertise(100000, instance=3):
+            async with self.aioble.periodic_advertise(100000, instance=4):
+                self.assertEqual(self.ble.periodic_instances, {3, 4})
+                self.assertEqual(self.ble.extended_instances, {3, 4})
         self.assertEqual(self.ble.extended_instances, set())
         self.assertEqual(self.ble.periodic_instances, set())
 

@@ -872,6 +872,23 @@ still requires hardware testing.
 Examples
 --------
 
+This branch also provides an optional `aioble-mesh` package. Install it from this
+checkout alongside aioble, then use `from aioble.mesh import Node`. It requires
+the ESP32 firmware's native `blemesh` module (first-stage ESP32-C3/C5/C6/H2/S3 /
+IDF 5.5.x >=5.5.3 (C5 >=5.5.5) or 6.1.x, with 5.5.5 recommended,
+PB-ADV only). The default aioble package does not import Mesh or replace its BLE
+IRQ handler. `Node` supports an async context, `recv(timeout_ms=...)`, async
+iteration, and synchronous `send(...)` submission; send completion is local,
+not a remote acknowledgement. See `ports/esp32/blemesh/README.md` in the parent
+MicroPython checkout for provisioning, coexistence limits and full examples.
+
+Current firmware defaults allocate five physical advertising instances
+(`CONFIG_BT_NIMBLE_MAX_EXT_ADV_INSTANCES=4`, in addition to instance 0).
+BLE5-only firmware exposes handles 0..4; Mesh firmware exposes 0..3 and reserves
+physical instance 4 for Mesh. Query `aioble.ble5_features()["advertising_instances"]`
+(5 or 4) before choosing an extended/periodic advertising instance. The SDK's
+configuration maximum is 4, so setting it to 5 cannot provide another instance.
+
 See the `examples` directory for some example applications.
 
 * temp_sensor.py: Temperature sensor peripheral.
