@@ -82,7 +82,7 @@ class FakeBLE:
             "periodic_advertising": True,
             "tx_power_set": True,
             "tx_power_get": True,
-            "advertising_instances": 3,
+            "advertising_instances": 5,
             "max_adv_data_len": 1650,
         }
 
@@ -1911,17 +1911,22 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(device, self.central._connecting)
 
     async def test_multiple_extended_advertisers_route_by_instance(self):
-        first = asyncio.create_task(self.aioble.advertise(100000, extended=True, instance=1))
-        second = asyncio.create_task(self.aioble.advertise(100000, extended=True, instance=2))
+        addresses = (b"aaaaaa", b"bbbbbb", b"cccccc", b"dddddd")
+        tasks = [
+            asyncio.create_task(self.aioble.advertise(100000, extended=True, instance=instance))
+            for instance in range(1, 5)
+        ]
         await asyncio.sleep(0)
-        self.ble.emit(1, (20, 0, b"aaaaaa"))
-        self.ble.emit(1, (21, 0, b"bbbbbb"))
-        self.ble.emit(42, (2, 0, 20))
-        self.ble.emit(42, (1, 0, 21))
-        a, b = await asyncio.gather(first, second)
-        self.assertEqual((a.device.addr, b.device.addr), (b"bbbbbb", b"aaaaaa"))
-        await a.disconnect()
-        await b.disconnect()
+        for index, address in enumerate(addresses):
+            self.ble.emit(1, (20 + index, 0, address))
+        for instance in range(4, 0, -1):
+            self.ble.emit(42, (instance, 0, 24 - instance))
+        connections = await asyncio.gather(*tasks)
+        self.assertEqual(
+            tuple(connection.device.addr for connection in connections), tuple(reversed(addresses))
+        )
+        for connection in connections:
+            await connection.disconnect()
 
     async def test_advertising_completion_before_connection(self):
         task = asyncio.create_task(self.aioble.advertise(100000, extended=True))
@@ -2260,7 +2265,7 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
         for instance, exception in (
             (0, ValueError),
             (-1, ValueError),
-            (3, ValueError),
+            (self.ble.ble5_features()["advertising_instances"], ValueError),
             (99, ValueError),
             (1.5, TypeError),
             ("1", TypeError),
@@ -2289,7 +2294,7 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_periodic_instance_leaves_no_cleanup_work(self):
         for instance, exception in (
             (0, ValueError),
-            (3, ValueError),
+            (self.ble.ble5_features()["advertising_instances"], ValueError),
             (99, ValueError),
             (1.5, TypeError),
         ):
@@ -2302,8 +2307,8 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.ble.calls, [])
                 self.assertEqual(self.peripheral._advertisers, {})
                 self.assertIsNone(self.peripheral._cleanup_task)
-        async with self.aioble.periodic_advertise(100000, instance=2):
-            self.assertEqual(self.ble.periodic_instances, {2})
+        async with self.aioble.periodic_advertise(100000, instance=4):
+            self.assertEqual(self.ble.periodic_instances, {4})
         self.assertEqual(self.ble.extended_instances, set())
         self.assertEqual(self.ble.periodic_instances, set())
 

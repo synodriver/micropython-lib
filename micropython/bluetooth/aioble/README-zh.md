@@ -597,6 +597,9 @@ except asyncio.TimeoutError:
 实例必须是
 `1 <= instance < aioble.ble5_features()["advertising_instances"]` 范围内的整数；
 无效类型会在预留实例前引发 `TypeError`，无效值会引发 `ValueError`。
+当前 ESP32 BLE5 固件默认 `advertising_instances=5`：实例 0 保留给传统广播，
+扩展广播使用实例 1～4；旧固件或自定义配置的容量以能力查询结果为准。
+多个广播与扫描、连接、周期同步共享控制器资源，实例容量不保证所有活动可同时运行。
 超时和任务取消只会停止选定的实例；扩展实例也会在完成时移除。
 与原 API 一样，`timeout_ms` 使用 asyncio 超时，取消时返回 `None`。
 
@@ -637,8 +640,8 @@ finally:
 手动指定载荷时，另一载荷为 `None` 会被清空，显式 `b""` 也表示清空；
 这与底层 `gap_advertise_ext()` 的 `None` 复用缓存语义不同。
 
-多个扩展实例可在独立任务中并行广播。以下两个实例各运行 10 秒；
-`advertising_instances` 至少为 3 才能使用实例 1 和 2。
+多个扩展实例可在独立任务中并行广播。以下四个实例各运行 10 秒；
+`advertising_instances` 至少为 5 才能使用实例 1～4。
 
 ```py
 async def broadcast(instance, sid, name):
@@ -650,10 +653,12 @@ async def broadcast(instance, sid, name):
     except asyncio.TimeoutError:
         print("实例结束", instance)
 
-if aioble.ble5_features().get("advertising_instances", 1) >= 3:
+if aioble.ble5_features().get("advertising_instances", 1) >= 5:
     await asyncio.gather(
         broadcast(1, 1, b"sensor-one"),
         broadcast(2, 2, b"sensor-two"),
+        broadcast(3, 3, b"sensor-three"),
+        broadcast(4, 4, b"sensor-four"),
     )
 ```
 

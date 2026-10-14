@@ -664,6 +664,11 @@ IRQ has no instance identifier. Reusing an occupied instance raises `ValueError`
 The instance must be an integer in
 `1 <= instance < aioble.ble5_features()["advertising_instances"]`; invalid types
 raise `TypeError` and invalid values raise `ValueError` before reserving it.
+The current ESP32 BLE5 firmware defaults to `advertising_instances=5`: instance 0
+is reserved for legacy advertising, and instances 1 through 4 are available for
+extended advertising. Query the capacity on older or custom firmware. Advertising,
+scanning, connections and periodic synchronisation share controller resources;
+the instance capacity does not guarantee that all activities can run together.
 Timeouts and task cancellation stop only the selected instance; extended
 instances are also removed on completion. As with the original API,
 `timeout_ms` uses an asyncio timeout, and cancellation returns `None`.
@@ -709,8 +714,8 @@ clears it. This differs from the low-level `gap_advertise_ext()` API, where `Non
 reuses cached data.
 
 Multiple extended instances can advertise concurrently in separate tasks. These
-two instances each run for 10 seconds; `advertising_instances` must be at least 3
-to use instances 1 and 2:
+four instances each run for 10 seconds; `advertising_instances` must be at least 5
+to use instances 1 through 4:
 
 ```py
 async def broadcast(instance, sid, name):
@@ -722,10 +727,12 @@ async def broadcast(instance, sid, name):
     except asyncio.TimeoutError:
         print("Instance finished", instance)
 
-if aioble.ble5_features().get("advertising_instances", 1) >= 3:
+if aioble.ble5_features().get("advertising_instances", 1) >= 5:
     await asyncio.gather(
         broadcast(1, 1, b"sensor-one"),
         broadcast(2, 2, b"sensor-two"),
+        broadcast(3, 3, b"sensor-three"),
+        broadcast(4, 4, b"sensor-four"),
     )
 ```
 
