@@ -51,6 +51,33 @@ def _ble5_method(name):
     return method
 
 
+class _FragmentBuffer:
+    # Retain the IRQ's owned bytes, then join ordinary chains only at completion.
+    def __init__(self, max_size):
+        self._parts = []
+        self._size = 0
+        self._max_size = max_size
+
+    def append(self, payload):
+        if self._parts is None:
+            return False
+        self._size += len(payload)
+        if self._size > self._max_size:
+            # Discard until the end of this chain, without retaining its data.
+            self._parts = None
+            return False
+        # Empty fragments must not grow an otherwise byte-bounded list.
+        if payload:
+            if len(self._parts) == 16:
+                # Bound object overhead even for chains of one-byte fragments.
+                self._parts = [self.finish()]
+            self._parts.append(payload)
+        return True
+
+    def finish(self):
+        return b"".join(self._parts)
+
+
 def ble5_features():
     method = getattr(ble, "ble5_features", None)
     if method:

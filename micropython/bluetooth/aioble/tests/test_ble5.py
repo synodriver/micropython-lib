@@ -441,6 +441,139 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.data_status, 2)
             self.assertIsNone(result.adv_data)
 
+    async def test_extended_long_advertisement_and_response_keep_owned_bytes(self):
+        payload = bytes(range(250)) * 6 + bytes(range(150))
+        async with self.aioble.scan(0, extended=True) as scanner:
+            # Interleave the two independent chains and a second SID.
+            for offset in range(0, len(payload), 150):
+                for properties in (1, 9):
+                    data = bytearray(payload[offset : offset + 150])
+                    self.ble.emit(
+                        41,
+                        self.report(
+                            status=0 if offset + 150 == len(payload) else 1,
+                            properties=properties,
+                            payload=data,
+                        ),
+                    )
+                    data[:] = b"x" * len(data)
+                if offset == 0:
+                    self.ble.emit(41, self.report(sid=2, payload=b"other"))
+            self.assertEqual((await scanner.__anext__()).adv_data, b"other")
+            result = await scanner.__anext__()
+            saved = result.adv_data
+            self.assertIsInstance(saved, bytes)
+            self.assertEqual(saved, payload)
+            self.assertIs(await scanner.__anext__(), result)
+            self.assertEqual(result.resp_data, payload)
+            self.ble.emit(41, self.report(payload=b"next"))
+            self.assertIs(await scanner.__anext__(), result)
+            self.assertEqual(result.adv_data, b"next")
+            self.assertEqual(saved, payload)
+        self.assertEqual(saved, payload)
+
+    async def test_extended_fragment_boundaries_and_empty_chain_recovery(self):
+        result = self.central.ScanResult(self.aioble.Device(0, b"abcdef"), sid=1)
+
+        # Feed owned bytes, as the scanner does after copying the IRQ memoryviews.
+        def update(payload, status):
+            report = self.report(payload=payload, status=status)
+            return result._update_extended((*report[:-1], payload))
+
+        for _ in range(100):
+            self.assertFalse(update(b"", 1))
+        update(b"", 0)
+        self.assertEqual((result.data_status, result.adv_data), (0, b""))
+        for ending in (b"", b"x"):
+            update(b"a" * 1650, 1)
+            update(ending, 0)
+            self.assertEqual(result.data_status, 2 if ending else 0)
+            self.assertEqual(result.adv_data, None if ending else b"a" * 1650)
+        update(b"a" * 1651, 1)
+        update(b"tail", 0)
+        self.assertEqual((result.data_status, result.adv_data), (2, None))
+        update(b"next", 0)
+        self.assertEqual((result.data_status, result.adv_data), (0, b"next"))
+
+    async def test_fragment_storage_bounds_small_and_empty_fragments(self):
+        fragments = self.central._FragmentBuffer(1650)
+        for _ in range(1000):
+            self.assertTrue(fragments.append(b""))
+        self.assertEqual(fragments._parts, [])
+        for _ in range(1650):
+            self.assertTrue(fragments.append(b"a"))
+            self.assertLessEqual(len(fragments._parts), 16)
+        self.assertEqual(fragments.finish(), b"a" * 1650)
+        self.assertFalse(fragments.append(b"x"))
+        self.assertIsNone(fragments._parts)
+        self.assertFalse(fragments.append(b""))
+
+    async def test_fragment_storage_does_not_copy_each_prefix(self):
+        class CountCopies(self.central._FragmentBuffer):
+            copied = 0
+
+            def finish(self):
+                result = super().finish()
+                self.copied += len(result)
+                return result
+
+        fragments = CountCopies(1650)
+        payload = bytes(range(150)) * 11
+        for offset in range(0, len(payload), 150):
+            fragments.append(payload[offset : offset + 150])
+        self.assertEqual(fragments.copied, 0)
+        self.assertEqual(fragments.finish(), payload)
+        self.assertEqual(fragments.copied, 1650)
+
+    async def test_fragment_allocation_failures_abort_both_consumers(self):
+        # Exercise allocation of the buffer, retaining a part, and batch compaction.
+        for module in (self.central, self.periodic):
+            for failure in ("create", "append", "compact"):
+                original = module._FragmentBuffer
+
+                class FailingBuffer(original):
+                    def __init__(self, limit):
+                        if failure == "create":
+                            raise MemoryError("fragment create")
+                        super().__init__(limit)
+                        if failure == "append":
+
+                            class FailingParts(list):
+                                def append(self, payload):
+                                    raise MemoryError("fragment append")
+
+                            self._parts = FailingParts()
+
+                    def finish(self):
+                        raise MemoryError("fragment compact")
+
+                module._FragmentBuffer = FailingBuffer
+                try:
+                    consumer = (
+                        await self.aioble.scan(0, extended=True).__aenter__()
+                        if module is self.central
+                        else await self.create_sync()
+                    )
+                    for _ in range(17):
+                        if module is self.central:
+                            self.ble.emit(41, self.report(status=1, payload=b"a"))
+                        else:
+                            self.ble.emit(44, (30, 1, -40, 0, b"a"))
+                    with self.assertRaisesRegex(MemoryError, "fragment " + failure):
+                        await consumer.__anext__()
+                    self.run_scheduled()
+                    await self.settle()
+                    self.assertFalse(consumer._queue)
+                    self.assertEqual(consumer._queue_bytes, 0)
+                    if module is self.central:
+                        self.assertFalse(consumer._results)
+                        self.assertFalse(self.ble.scanning)
+                    else:
+                        self.assertIsNone(consumer._fragments)
+                        self.assertFalse(consumer.is_synced())
+                finally:
+                    module._FragmentBuffer = original
+
     async def test_scan_start_failure_does_not_leave_active_scanner(self):
         self.ble.fail["gap_scan_ext"] = OSError(22)
         with self.assertRaises(OSError):
@@ -641,11 +774,12 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
             self.ble.emit(41, self.report())
             result = await scanner.__anext__()
 
-            class NoConcat(bytes):
-                def __add__(self, other):
+            class NoJoin(self.central._FragmentBuffer):
+                def finish(self):
                     raise MemoryError("fragment allocation failed")
 
-            result._fragments[False] = NoConcat(b"prefix")
+            result._fragments[False] = NoJoin(1650)
+            result._fragments[False].append(b"prefix")
             self.ble.emit(41, self.report(payload=b"suffix"))
             with self.assertRaisesRegex(MemoryError, "fragment allocation failed"):
                 await scanner.__anext__()
@@ -2432,13 +2566,421 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(self.ble.calls), calls)
             self.assertIs(self.peripheral._advertisers[1], owner._advertiser)
 
-    async def create_sync(self, handle=30):
+    async def create_sync(self, handle=30, **kwargs):
         task = asyncio.create_task(
-            self.aioble.periodic_sync(self.aioble.Device(0, b"abcdef"), sid=2)
+            self.aioble.periodic_sync(self.aioble.Device(0, b"abcdef"), sid=2, **kwargs)
         )
         await asyncio.sleep(0)
         self.ble.emit(43, (0, handle, 2, 80, 2, 0, memoryview(b"abcdef")))
         return await task
+
+    async def test_periodic_limits_validate_before_create(self):
+        for key in ("max_queue", "max_queue_bytes"):
+            for value in (0, -1, None, 1.5, "32"):
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(ValueError):
+                        await self.aioble.periodic_sync(
+                            self.aioble.Device(0, b"abcdef"), sid=2, **{key: value}
+                        )
+                    self.assertIsNone(self.periodic._pending_sync)
+        self.assertFalse(any(c[0] == "gap_periodic_sync" for c in self.ble.calls))
+
+    async def test_periodic_queue_limit_stops_outside_irq_without_consumer(self):
+        sync = await self.create_sync(max_queue=2)
+        handler = self.ble.handler
+        sync._fragments = self.periodic._FragmentBuffer(1650)
+        sync._fragments.append(b"old chain")
+        for _ in range(3):
+            self.ble.emit(44, (30, 1, -40, 0, b"part"))
+        self.assertEqual(sync._queue, [])
+        self.assertEqual(sync._queue_bytes, 0)
+        self.assertIsNone(sync._fragments)
+        self.assertTrue(sync.is_synced())
+        self.assertFalse(any(c[0] == "gap_periodic_sync_stop" for c in self.ble.calls))
+        self.assertEqual(len(self.scheduled), 1)
+        for _ in range(50):
+            self.ble.emit(44, (30, 0, -40, 0, b"discarded"))
+        self.assertEqual(sync._queue, [])
+        self.assertEqual(len(self.scheduled), 1)
+        self.assertIs(self.ble.handler, handler)
+        self.run_scheduled()
+        await self.settle()
+        self.assertFalse(sync.is_synced())
+        with self.assertRaisesRegex(MemoryError, "periodic queue limit exceeded"):
+            await sync.__anext__()
+
+    async def test_periodic_create_overflow_preserves_error_after_stop(self):
+        for limits in ({"max_queue": 2}, {"max_queue_bytes": 8}):
+            with self.subTest(limits=limits):
+                task = asyncio.create_task(
+                    self.aioble.periodic_sync(self.aioble.Device(0, b"abcdef"), sid=2, **limits)
+                )
+                await asyncio.sleep(0)
+                sync = self.periodic._pending_sync
+                self.ble.emit(43, (0, 30, 2, 80, 2, 0, b"abcdef"))
+                for _ in range(3):
+                    self.ble.emit(44, (30, 1, -40, 0, b"part"))
+                self.run_scheduled()
+                # ESP32 reports EDONE=14 when the scheduled stop completes.
+                self.ble.emit(45, (30, 14))
+                with self.assertRaisesRegex(MemoryError, "periodic queue limit exceeded"):
+                    await task
+                self.assertEqual(sync.reason, 14)
+                self.assertEqual(sync._queue, [])
+                self.assertEqual(sync._queue_bytes, 0)
+                self.assertIsNone(sync._fragments)
+                self.assertIsNone(self.periodic._pending_sync)
+                self.assertEqual(self.periodic._syncs, {})
+                await self.settle()
+                new = await self.create_sync()
+                await new.close()
+
+    async def test_periodic_create_overflow_retains_slot_until_stop(self):
+        def defer_stop(handle):
+            self.ble.calls.append(("gap_periodic_sync_stop", (handle,), {}))
+
+        self.ble.gap_periodic_sync_stop = defer_stop
+        try:
+            task = asyncio.create_task(
+                self.aioble.periodic_sync(self.aioble.Device(0, b"abcdef"), sid=2, max_queue=1)
+            )
+            await asyncio.sleep(0)
+            sync = self.periodic._pending_sync
+            self.ble.emit(43, (0, 30, 2, 80, 2, 0, b"abcdef"))
+            self.ble.emit(44, (30, 1, -40, 0, b"a"))
+            self.ble.emit(44, (30, 0, -40, 0, b"b"))
+            with self.assertRaisesRegex(MemoryError, "periodic queue limit exceeded"):
+                await task
+            await self.settle()
+            self.assertIs(self.periodic._pending_sync, sync)
+            self.assertIs(self.periodic._syncs[30], sync)
+            self.assertIsNotNone(sync._cleanup_task)
+            self.assertEqual(sync._queue, [])
+            self.assertEqual(sync._queue_bytes, 0)
+            with self.assertRaisesRegex(ValueError, "already pending"):
+                await self.aioble.periodic_sync(self.aioble.Device(0, b"abcdef"), sid=2)
+            self.ble.emit(45, (30, 14))
+            await self.settle()
+            self.assertIsNone(self.periodic._pending_sync)
+            self.assertIsNone(sync._cleanup_task)
+            self.assertEqual(self.periodic._syncs, {})
+            new = await self.create_sync()
+            # The queued callback from the old owner cannot stop the new sync.
+            self.run_scheduled()
+            self.assertIs(self.periodic._syncs[30], new)
+            self.assertEqual(sum(c[0] == "gap_periodic_sync_stop" for c in self.ble.calls), 1)
+        finally:
+            del self.ble.gap_periodic_sync_stop
+        await new.close()
+
+    async def test_periodic_create_allocation_failure_preserves_error(self):
+        class BadPayload:
+            def __len__(self):
+                return 1
+
+            def __bytes__(self):
+                raise MemoryError
+
+        class BadQueue(list):
+            def append(self, report):
+                raise MemoryError
+
+        for copy_failure in (True, False):
+            for stopped in (True, False):
+                with self.subTest(copy_failure=copy_failure, stopped=stopped):
+                    task = asyncio.create_task(
+                        self.aioble.periodic_sync(self.aioble.Device(0, b"abcdef"), sid=2)
+                    )
+                    await asyncio.sleep(0)
+                    sync = self.periodic._pending_sync
+                    if not copy_failure:
+                        sync._queue = BadQueue()
+                    self.ble.emit(43, (0, 30, 2, 80, 2, 0, b"abcdef"))
+                    self.ble.emit(44, (30, 0, -40, 0, BadPayload() if copy_failure else b"x"))
+                    if stopped:
+                        self.run_scheduled()
+                        self.ble.emit(45, (30, 14))
+                    with self.assertRaisesRegex(MemoryError, "periodic buffer allocation failed"):
+                        await task
+                    self.run_scheduled()
+                    await self.settle()
+                    self.assertEqual(sync._queue, [])
+                    self.assertEqual(sync._queue_bytes, 0)
+                    self.assertIsNone(self.periodic._pending_sync)
+                    self.assertEqual(self.periodic._syncs, {})
+
+    async def test_periodic_create_real_loss_keeps_loss_reason(self):
+        task = asyncio.create_task(
+            self.aioble.periodic_sync(self.aioble.Device(0, b"abcdef"), sid=2)
+        )
+        await asyncio.sleep(0)
+        self.ble.emit(43, (0, 30, 2, 80, 2, 0, b"abcdef"))
+        self.ble.emit(45, (30, 13))
+        with self.assertRaises(self.aioble.PeriodicSyncLostError) as raised:
+            await task
+        self.assertEqual(raised.exception.reason, 13)
+        self.assertIsNone(self.periodic._pending_sync)
+        self.assertEqual(self.periodic._syncs, {})
+
+    async def test_periodic_create_with_buffered_reports_still_succeeds(self):
+        task = asyncio.create_task(
+            self.aioble.periodic_sync(
+                self.aioble.Device(0, b"abcdef"), sid=2, max_queue=2, max_queue_bytes=8
+            )
+        )
+        await asyncio.sleep(0)
+        self.ble.emit(43, (0, 30, 2, 80, 2, 0, b"abcdef"))
+        self.ble.emit(44, (30, 1, -40, 0, b"1234"))
+        self.ble.emit(44, (30, 0, -40, 0, b"5678"))
+        sync = await task
+        self.assertEqual((await sync.__anext__()).adv_data, b"12345678")
+        self.assertIsNone(self.periodic._pending_sync)
+        self.assertEqual(self.scheduled, [])
+        await sync.close()
+
+    async def test_periodic_byte_budget_boundary_and_reuse(self):
+        sync = await self.create_sync(max_queue=4, max_queue_bytes=6)
+        self.ble.emit(44, (30, 1, -40, 0, b"abc"))
+        self.ble.emit(44, (30, 0, -40, 0, b"def"))
+        self.assertEqual(sync._queue_bytes, 6)
+        self.assertEqual((await sync.__anext__()).adv_data, b"abcdef")
+        self.assertEqual(sync._queue_bytes, 0)
+        self.ble.emit(44, (30, 0, -40, 0, b"123456"))
+        self.assertEqual((await sync.__anext__()).adv_data, b"123456")
+        self.ble.emit(44, (30, 1, -40, 0, b"123456"))
+        self.ble.emit(44, (30, 0, -40, 0, b"7"))
+        with self.assertRaisesRegex(MemoryError, "periodic queue limit exceeded"):
+            await sync.__anext__()
+        await sync.close()
+
+    async def test_periodic_zero_length_reports_are_count_bounded(self):
+        sync = await self.create_sync(max_queue=2)
+        for _ in range(3):
+            self.ble.emit(44, (30, 1, -40, 0, b""))
+        with self.assertRaises(MemoryError):
+            await sync.__anext__()
+        await sync.close()
+
+    async def test_periodic_oversized_queue_payload_is_not_copied(self):
+        sync = await self.create_sync(max_queue_bytes=1)
+
+        class TooBig:
+            def __len__(self):
+                return 2
+
+            def __bytes__(self):
+                raise AssertionError("must check budget before copying")
+
+        self.ble.emit(44, (30, 0, -40, 0, TooBig()))
+        with self.assertRaisesRegex(MemoryError, "periodic queue limit exceeded"):
+            await sync.__anext__()
+        await sync.close()
+
+    async def test_periodic_copy_and_append_memory_failures_do_not_escape_irq(self):
+        class BadPayload:
+            def __len__(self):
+                return 1
+
+            def __bytes__(self):
+                raise MemoryError
+
+        class BadQueue(list):
+            def append(self, report):
+                raise MemoryError
+
+        for copy_failure in (True, False):
+            sync = await self.create_sync()
+            if not copy_failure:
+                sync._queue = BadQueue()
+            handler = self.ble.handler
+            self.ble.emit(44, (30, 0, -40, 0, BadPayload() if copy_failure else b"x"))
+            self.assertIs(self.ble.handler, handler)
+            self.assertEqual(sync._queue, [])
+            self.assertEqual(sync._queue_bytes, 0)
+            self.run_scheduled()
+            await self.settle()
+            with self.assertRaisesRegex(MemoryError, "periodic buffer allocation failed"):
+                await sync.__anext__()
+
+    async def test_periodic_full_scheduler_retries_on_report(self):
+        sync = await self.create_sync(max_queue=1)
+        original = self.periodic.schedule
+        for exception in (RuntimeError, MemoryError):
+
+            def full(*args):
+                raise exception
+
+            self.periodic.schedule = full
+            self.ble.emit(44, (30, 1, -40, 0, b"a"))
+            self.ble.emit(44, (30, 0, -40, 0, b"b"))
+            self.assertFalse(sync._stop_scheduled)
+            self.assertEqual(sync._queue, [])
+        self.periodic.schedule = original
+        self.ble.emit(44, (30, 0, -40, 0, b"retry"))
+        self.run_scheduled()
+        await self.settle()
+        self.assertFalse(sync.is_synced())
+
+    async def test_periodic_stop_failure_retains_owner_and_retries(self):
+        sync = await self.create_sync(max_queue=1)
+        self.ble.emit(44, (30, 1, -40, 0, b"a"))
+        self.ble.emit(44, (30, 0, -40, 0, b"b"))
+        for error in (OSError(12), MemoryError()):
+            self.ble.fail["gap_periodic_sync_stop"] = error
+            self.run_scheduled()
+            self.assertIs(self.periodic._syncs[30], sync)
+            self.assertFalse(sync._stop_requested)
+            self.ble.emit(44, (30, 0, -40, 0, b"retry"))
+            self.assertEqual(sync._queue, [])
+        self.run_scheduled()
+        await self.settle()
+        self.assertFalse(sync.is_synced())
+
+    async def test_periodic_close_after_overflow_does_not_stop_twice(self):
+        sync = await self.create_sync(max_queue=1)
+        self.ble.emit(44, (30, 1, -40, 0, b"a"))
+        self.ble.emit(44, (30, 0, -40, 0, b"b"))
+        await sync.close()
+        self.run_scheduled()
+        self.assertEqual(sum(c[0] == "gap_periodic_sync_stop" for c in self.ble.calls), 1)
+
+    async def test_periodic_delayed_stop_cannot_stop_reused_handle(self):
+        old = await self.create_sync(max_queue=1)
+        self.ble.emit(44, (30, 1, -40, 0, b"a"))
+        self.ble.emit(44, (30, 0, -40, 0, b"b"))
+        self.ble.emit(45, (30, 13))
+        new = await self.create_sync()
+        self.run_scheduled()
+        self.assertFalse(any(c[0] == "gap_periodic_sync_stop" for c in self.ble.calls))
+        self.assertIs(self.periodic._syncs[30], new)
+        with self.assertRaises(MemoryError):
+            await old.__anext__()
+        await new.close()
+
+    async def test_periodic_failure_wakes_waiter_and_preserves_other_sync(self):
+        sync = await self.create_sync(max_queue_bytes=1)
+        other = await self.create_sync(31)
+        waiter = asyncio.create_task(sync.__anext__())
+        await asyncio.sleep(0)
+        self.ble.emit(44, (30, 0, -40, 0, b"xx"))
+        with self.assertRaises(MemoryError):
+            await waiter
+        self.run_scheduled()
+        await self.settle()
+        self.ble.emit(44, (31, 0, -40, 0, b"good"))
+        self.assertEqual((await other.__anext__()).adv_data, b"good")
+        await other.close()
+
+    async def test_periodic_close_loss_and_shutdown_clear_all_buffers(self):
+        for action in ("close", "loss", "stop"):
+            sync = await self.create_sync()
+            sync._fragments = self.periodic._FragmentBuffer(1650)
+            sync._fragments.append(b"partial")
+            self.ble.emit(44, (30, 1, -40, 0, b"queued"))
+            if action == "close":
+                await sync.close()
+            elif action == "loss":
+                self.ble.emit(45, (30, 13))
+            else:
+                self.aioble.stop()
+            self.assertEqual((sync._queue, sync._queue_bytes, sync._fragments), ([], 0, None))
+            with self.assertRaises(self.aioble.PeriodicSyncLostError):
+                await sync.__anext__()
+
+    async def test_periodic_close_failure_discards_reports_and_can_retry(self):
+        sync = await self.create_sync()
+        self.ble.fail["gap_periodic_sync_stop"] = OSError(12)
+        with self.assertRaises(OSError):
+            await sync.close()
+        self.ble.emit(44, (30, 0, -40, 0, b"ignored"))
+        self.assertEqual(sync._queue, [])
+        self.assertIs(self.periodic._syncs[30], sync)
+        await sync.close()
+        self.run_scheduled()
+        self.assertFalse(sync.is_synced())
+
+    async def test_periodic_context_cleanup_preserves_original_error(self):
+        sync = await self.create_sync()
+        self.ble.fail["gap_periodic_sync_stop"] = OSError(12)
+        with self.assertRaisesRegex(ValueError, "body failure"):
+            async with sync:
+                raise ValueError("body failure")
+        self.run_scheduled()
+        await self.settle()
+        self.assertFalse(sync.is_synced())
+
+    async def test_periodic_reassembly_and_report_memory_failure_cleanup(self):
+        class BadFragments(self.periodic._FragmentBuffer):
+            def finish(self):
+                raise MemoryError("concat failed")
+
+        def bad_report(*args):
+            raise MemoryError("report failed")
+
+        original = self.periodic.PeriodicReport
+        for concat_failure in (True, False):
+            sync = await self.create_sync()
+            if concat_failure:
+                sync._fragments = BadFragments(1650)
+                sync._fragments.append(b"a")
+            else:
+                self.periodic.PeriodicReport = bad_report
+            self.ble.emit(44, (30, 0, -40, 0, b"b"))
+            with self.assertRaisesRegex(MemoryError, "concat failed|report failed"):
+                await sync.__anext__()
+            self.periodic.PeriodicReport = original
+            self.assertEqual((sync._queue, sync._queue_bytes, sync._fragments), ([], 0, None))
+            self.run_scheduled()
+            await self.settle()
+            self.assertFalse(sync.is_synced())
+
+    async def test_periodic_1650_chain_and_overlength_resynchronisation(self):
+        sync = await self.create_sync()
+        payload = bytes(range(250)) * 6 + bytes(range(150))
+        for i in range(0, len(payload), 130):
+            self.ble.emit(
+                44, (30, 0 if i + 130 >= len(payload) else 1, -40, 0, payload[i : i + 130])
+            )
+        self.assertEqual((await sync.__anext__()).adv_data, payload)
+        self.assertEqual(sync._queue_bytes, 0)
+        self.ble.emit(44, (30, 1, -40, 0, payload))
+        self.ble.emit(44, (30, 1, -40, 0, b"excess"))
+        self.ble.emit(44, (30, 0, -40, 0, b"tail"))
+        report = await sync.__anext__()
+        self.assertEqual((report.data_status, report.adv_data), (2, None))
+        self.ble.emit(44, (30, 0, -40, 0, b"next"))
+        self.assertEqual((await sync.__anext__()).adv_data, b"next")
+        await sync.close()
+
+    async def test_periodic_irq_clear_during_pop_returns_failure_not_indexerror(self):
+        sync = await self.create_sync()
+
+        class ClearingQueue(list):
+            def pop(queue, index):
+                sync._fail("periodic queue limit exceeded")
+                return super().pop(index)
+
+        sync._queue = ClearingQueue([(0, -40, 0, b"data")])
+        sync._queue_bytes = 4
+        with self.assertRaisesRegex(MemoryError, "periodic queue limit exceeded"):
+            await sync.__anext__()
+        await sync.close()
+
+    async def test_periodic_failure_during_reassembly_cannot_publish_partial_result(self):
+        sync = await self.create_sync()
+
+        class InterruptingFragments(self.periodic._FragmentBuffer):
+            def finish(self):
+                sync._fail("periodic queue limit exceeded")
+                return super().finish()
+
+        sync._fragments = InterruptingFragments(1650)
+        sync._fragments.append(b"a")
+        self.ble.emit(44, (30, 0, -40, 0, b"b"))
+        with self.assertRaises(MemoryError):
+            await sync.__anext__()
+        self.assertIsNone(sync._fragments)
+        await sync.close()
 
     async def test_periodic_sync_reports_loss_and_context_exit(self):
         sync = await self.create_sync()

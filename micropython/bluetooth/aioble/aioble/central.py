@@ -16,6 +16,7 @@ from .core import (
     log_warn,
     register_irq_handler,
     _ble5_method,
+    _FragmentBuffer,
 )
 from .device import Device, DeviceConnection, DeviceTimeout
 
@@ -294,17 +295,21 @@ class ScanResult:
             payload,
         ) = report
         response = bool(properties & _PROP_SCAN_RESPONSE)
-        fragments = self._fragments.pop(response, b"")
-        payload = fragments + payload if fragments is not None else None
+        fragments = self._fragments.pop(response, None)
+        if fragments is None and status == 1:
+            fragments = _FragmentBuffer(_ADV_EXT_PAYLOAD_MAX_LEN)
+        valid = (
+            fragments.append(payload)
+            if fragments is not None
+            else len(payload) <= _ADV_EXT_PAYLOAD_MAX_LEN
+        )
         if status == 1:
-            self._fragments[response] = (
-                payload
-                if payload is not None and len(payload) <= _ADV_EXT_PAYLOAD_MAX_LEN
-                else None
-            )
+            self._fragments[response] = fragments
             return False
-        if payload is None or len(payload) > _ADV_EXT_PAYLOAD_MAX_LEN:
+        if not valid:
             status = 2
+        if status == 0 and fragments is not None:
+            payload = fragments.finish()
 
         field = "resp_data" if response else "adv_data"
         payload = payload if status == 0 else None

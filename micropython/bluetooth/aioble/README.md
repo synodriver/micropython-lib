@@ -539,8 +539,8 @@ and scan response data. Incomplete fragments are withheld. Truncated or
 oversized chains produce `data_status=2` with the affected payload set to
 `None`; they are never parsed as complete advertising data. The assembled
 payload limit is 1650 bytes. Address and payload memoryviews are copied during
-the IRQ. Scan buffering is bounded as described below. Periodic reports still
-need prompt consumption; their queues are not covered by these scan limits.
+the IRQ. Scan buffering is bounded as described below. Periodic reports have
+separate queue limits, described under periodic synchronisation.
 The scanner yields the same `ScanResult` object again as it changes. Copy the
 fields you need when storing historical results rather than keeping only an
 object reference. `data_status` describes the most recent report; advertising
@@ -610,6 +610,16 @@ If result creation or fragment assembly raises `MemoryError` in the consumer,
 the scanner also closes, clears its caches and schedules a stop before
 re-raising the original exception. Catching it inside the scan context does not
 allow the scan to keep collecting reports.
+
+Extended scan and periodic synchronization retain each copied fragment and join
+an ordinary chain once it ends; they do not recopy the accumulated prefix for
+every fragment. Very many small fragments are compacted in batches to bound
+object overhead, so the final join can still require one temporary allocation of
+up to 1650 bytes.
+This optimization requires the updated `aioble-core`. Update the whole aioble
+package together, rather than mixing an old core with new receiving modules.
+For `.mpy` deployments, regenerate and install the updated modules, then restart
+the interpreter.
 
 On IRQ overflow, stopping is deferred through `micropython.schedule`, not an
 asyncio task or a reentrant controller call. It can therefore run at VM safe
@@ -818,7 +828,7 @@ established; periodic reception does not require the scanner to keep running.
 Breaking the report loop closes the sync through its context manager.
 
 `periodic_sync(device, *, sid=None, skip=0, timeout_ms=10000,
-sync_timeout_ms=10000)` accepts a `Device` with an explicit SID or an extended
+sync_timeout_ms=10000, max_queue=32, max_queue_bytes=8192)` accepts a `Device` with an explicit SID or an extended
 `ScanResult`, and returns a `PeriodicSync`. `timeout_ms` is the local asyncio
 deadline; `sync_timeout_ms` is the controller timeout (100..163840ms).
 A local timeout raises `asyncio.TimeoutError`; a controller creation failure
@@ -858,6 +868,46 @@ truncated/failed reports have `adv_data=None` and retain their status.
 report only when the chain ends; complete payloads have the same 1650-byte limit.
 Closing waits for the sync-lost event. Do not close an established sync while
 another create is pending: NimBLE rejects termination with a busy error.
+
+Each sync limits its pending IRQ reports with `max_queue` (default 32) and
+`max_queue_bytes` (default 8192 payload bytes). Both must be positive integers.
+Fragments count individually, including zero-length reports; the byte budget
+is released as reports are consumed. It excludes Python object overhead, the
+partial chain (at most 1650 bytes), the final assembly temporary, and reports held
+by the application. These are per-sync limits, independent of scan limits.
+
+Exceeding either limit aborts that sync: queued data and partial fragments are
+discarded, further reports are ignored, and iteration raises
+`MemoryError("periodic queue limit exceeded")`. Payload-copy or enqueue allocation
+failures use `MemoryError("periodic buffer allocation failed")`; allocation
+failures during assembly or report construction also abort the sync and propagate
+to the consumer. Missing fragments are never silently joined into a complete
+report after overflow. A new sync is needed to resume reception.
+
+Reports can arrive after the controller establishes a sync but before
+`await aioble.periodic_sync(...)` returns. Queue overflow or enqueue allocation
+failure in that window makes creation raise the corresponding `MemoryError`,
+preserving the original error even if a stop-completion or sync-loss event arrives
+first. Background cleanup still terminates the sync; new creation requests may
+raise the pending-slot `ValueError` until termination is confirmed. Genuine sync
+loss without an internal receive error still raises `PeriodicSyncLostError(reason)`.
+
+Failure schedules controller termination at a VM safe point, without requiring
+the asyncio consumer to run. If scheduling or termination fails, later reports
+or an explicit `await sync.close()` retry cleanup. Ownership is retained until
+sync loss is confirmed, so a delayed cleanup cannot terminate a new sync using
+the same handle. Closing, sync loss, and `aioble.stop()` clear buffered data;
+previously returned reports remain valid. If context cleanup fails while the
+body is already raising an exception, the original exception is preserved.
+
+The finite defaults intentionally make slow or interrupted consumption fail
+earlier; adjust both limits for the expected burst size and available memory.
+Use `async with sync` or `await sync.close()` for normal cleanup. An outer
+`finally: aioble.stop()` is appropriate when the script owns BLE and Ctrl+C
+interrupts `asyncio.run()`. Queue protection does not detect Ctrl+C immediately,
+guarantee termination without subsequent reports when scheduling fails, or fix
+controller truncation/native-heap exhaustion. Severe memory pressure can still
+prevent Python cleanup.
 
 If creation times out or is cancelled, background cleanup cancels the pending
 controller request, waits for its final event, and terminates any sync that
