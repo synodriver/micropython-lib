@@ -313,6 +313,7 @@ async def advertise(  # noqa: PLR0913
     primary_phy=1,
     secondary_phy=1,
     sid=0,
+    tx_power=None,
 ):
     ensure_active()
     advertise_ext = _ble5_method("gap_advertise_ext") if extended else None
@@ -416,6 +417,10 @@ async def advertise(  # noqa: PLR0913
                 interval_us, adv_data=adv_data, resp_data=resp_data, connectable=connectable
             )
         started = True
+        if tx_power is not None:
+            # The ESP32 fork reconfigures the instance in gap_advertise*. Apply
+            # the SDK power level after each start, before yielding to tasks.
+            _ble5_method("gap_set_tx_power")(bluetooth.TX_POWER_TYPE_ADV, key, tx_power)
         # Allow optional timeout for a central to connect to us (or just to stop advertising).
         with DeviceTimeout(None, timeout_ms):
             while advertiser.connection is None and advertiser.reason is None:

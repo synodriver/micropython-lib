@@ -15,6 +15,7 @@ from .core import (
     set_default_phy,
     set_tx_power,
     get_tx_power,
+    PeriodicSyncLostError,
 )
 
 try:
@@ -22,15 +23,18 @@ try:
 except:
     log_info("Peripheral support disabled")
 
-try:
-    from .central import scan
-except:
-    log_info("Central support disabled")
 
-try:
-    from .periodic import periodic_sync, PeriodicSyncLostError
-except:
-    log_info("Periodic sync support disabled")
+def scan(*args, **kwargs):
+    # 纯外设无需加载扫描器；首次扫描时再导入并注册相关 IRQ。
+    from .central import scan as create_scan
+    return create_scan(*args, **kwargs)
+
+
+def periodic_sync(*args, **kwargs):
+    # 接收周期广播是可选功能，避免启动 NUS 时占用这部分内存。
+    from .periodic import periodic_sync as create_sync
+    return create_sync(*args, **kwargs)
+
 
 try:
     from .server import (

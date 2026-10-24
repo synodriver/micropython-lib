@@ -5,7 +5,7 @@ from micropython import const, schedule
 
 import asyncio
 
-from .core import ble, _ble5_method, _FragmentBuffer, register_irq_handler, log_error
+from .core import ble, _ble5_method, _FragmentBuffer, register_irq_handler, log_error, PeriodicSyncLostError
 from .device import Device, DeviceTimeout
 
 
@@ -19,11 +19,6 @@ _STOP_ERRORS = (OSError, MemoryError)
 
 _pending_sync = None
 _syncs = {}
-
-
-class PeriodicSyncLostError(Exception):
-    def __init__(self, reason):
-        self.reason = reason
 
 
 def _periodic_irq(event, data):

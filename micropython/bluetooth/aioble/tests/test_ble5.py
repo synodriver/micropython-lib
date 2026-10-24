@@ -200,13 +200,15 @@ class FakeBLE:
 
 
 class BLE5Tests(unittest.IsolatedAsyncioTestCase):
-    def load_aioble(self, modern=True):
+    def load_aioble(self, modern=True, eager=True):
         for name in list(sys.modules):
             if name == "aioble" or name.startswith("aioble."):
                 del sys.modules[name]
         self.ble = FakeBLE(modern)
         bluetooth = types.ModuleType("bluetooth")
         bluetooth.BLE = lambda: self.ble
+        if modern:
+            bluetooth.TX_POWER_TYPE_ADV = 1
         micropython = types.ModuleType("micropython")
         micropython.const = lambda value: value
         self.scheduled = []
@@ -214,9 +216,9 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
         sys.modules["bluetooth"] = bluetooth
         sys.modules["micropython"] = micropython
         self.aioble = importlib.import_module("aioble")
-        self.central = importlib.import_module("aioble.central")
+        self.central = importlib.import_module("aioble.central") if eager else None
         self.peripheral = importlib.import_module("aioble.peripheral")
-        self.periodic = importlib.import_module("aioble.periodic")
+        self.periodic = importlib.import_module("aioble.periodic") if eager else None
         return self.aioble
 
     async def asyncSetUp(self):
@@ -250,6 +252,105 @@ class BLE5Tests(unittest.IsolatedAsyncioTestCase):
             3,
             memoryview(payload),
         )
+
+    async def test_peripheral_use_leaves_receivers_unloaded(self):
+        self.load_aioble(eager=False)
+        core = importlib.import_module("aioble.core")
+        self.assertIs(self.aioble.PeriodicSyncLostError, core.PeriodicSyncLostError)
+        self.assertNotIn("aioble.central", sys.modules)
+        self.assertNotIn("aioble.periodic", sys.modules)
+        task = asyncio.create_task(self.aioble.advertise(100000, connectable=False))
+        await asyncio.sleep(0)
+        task.cancel()
+        self.assertIsNone(await task)
+        self.assertNotIn("aioble.central", sys.modules)
+        self.assertNotIn("aioble.periodic", sys.modules)
+
+    async def test_first_scan_loads_handler_once(self):
+        self.load_aioble(eager=False)
+        self.assertNotIn("aioble.central", sys.modules)
+        for _ in range(2):
+            async with self.aioble.scan(1000) as scanner:
+                self.ble.emit(5, (0, b"abcdef", 0, -40, b"\x04\x09MPY"))
+                self.assertEqual((await scanner.__anext__()).name(), "MPY")
+            self.assertFalse(self.ble.scanning)
+        central = importlib.import_module("aioble.central")
+        core = importlib.import_module("aioble.core")
+        self.assertEqual(core._irq_handlers.count(central._central_irq), 1)
+        self.assertNotIn("aioble.periodic", sys.modules)
+
+    async def test_first_connect_without_scan_loads_central(self):
+        self.load_aioble(eager=False)
+        self.assertNotIn("aioble.central", sys.modules)
+        connection = await self.aioble.Device(0, b"abcdef").connect()
+        self.assertTrue(connection.is_connected())
+        await connection.disconnect()
+        self.assertIn("aioble.central", sys.modules)
+        self.assertNotIn("aioble.periodic", sys.modules)
+
+    async def test_first_periodic_sync_cancellation_and_loss(self):
+        self.load_aioble(eager=False)
+        loss_type = self.aioble.PeriodicSyncLostError
+        self.assertNotIn("aioble.periodic", sys.modules)
+        task = asyncio.create_task(
+            self.aioble.periodic_sync(self.aioble.Device(0, b"abcdef"), sid=2)
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self.settle()
+        periodic = importlib.import_module("aioble.periodic")
+        self.assertIsNone(periodic._pending_sync)
+        self.assertIs(loss_type, periodic.PeriodicSyncLostError)
+        sync = await self.create_sync()
+        self.ble.emit(45, (30, 8))
+        with self.assertRaises(loss_type) as error:
+            await sync.__anext__()
+        self.assertEqual(error.exception.reason, 8)
+        core = importlib.import_module("aioble.core")
+        self.assertEqual(core._irq_handlers.count(periodic._periodic_irq), 1)
+        self.assertNotIn("aioble.central", sys.modules)
+
+    async def test_advertise_tx_power_applied_on_each_start(self):
+        for extended in (False, True):
+            for level in (0, 9):
+                with self.subTest(extended=extended, level=level):
+                    task = asyncio.create_task(
+                        self.aioble.advertise(
+                            100000, connectable=False, extended=extended, instance=3, tx_power=level
+                        )
+                    )
+                    await asyncio.sleep(0)
+                    start = "gap_advertise_ext" if extended else "gap_advertise"
+                    self.assertEqual(self.ble.calls[-2][0], start)
+                    self.assertEqual(
+                        self.ble.calls[-1],
+                        ("gap_set_tx_power", (1, 3 if extended else 0, level), {}),
+                    )
+                    task.cancel()
+                    self.assertIsNone(await task)
+                    self.assertFalse(self.peripheral._advertisers)
+                    self.assertFalse(self.ble.extended_instances)
+
+    async def test_advertise_tx_power_failure_stops_advertising(self):
+        for extended in (False, True):
+            for error in (OSError(12), MemoryError()):
+                with self.subTest(extended=extended, error=type(error)):
+                    self.ble.fail["gap_set_tx_power"] = error
+                    with self.assertRaises(type(error)) as raised:
+                        await self.aioble.advertise(
+                            100000, connectable=False, extended=extended, instance=3, tx_power=9
+                        )
+                    self.assertIs(raised.exception, error)
+                    stop = (
+                        ("gap_advertise_ext_stop", (3,), {"remove": True})
+                        if extended
+                        else ("gap_advertise", (None,), {})
+                    )
+                    self.assertEqual(self.ble.calls[-1], stop)
+                    self.assertFalse(self.peripheral._advertisers)
+                    self.assertFalse(self.ble.extended_instances)
 
     async def test_legacy_scan_and_connect(self):
         async with self.aioble.scan(1000) as scanner:

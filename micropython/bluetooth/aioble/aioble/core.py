@@ -27,6 +27,12 @@ class GattError(Exception):
         self._status = status
 
 
+class PeriodicSyncLostError(Exception):
+    # 保持顶层异常类型可用，不必为捕获异常而加载整个接收模块。
+    def __init__(self, reason):
+        self.reason = reason
+
+
 def ensure_active():
     if not ble.active():
         try:
